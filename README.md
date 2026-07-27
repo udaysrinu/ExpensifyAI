@@ -1,8 +1,40 @@
-# Splitwise MCP Server
+# ExpensifyAI
 
-A Model Context Protocol (MCP) server for [Splitwise](https://www.splitwise.com/), enabling AI agents to manage expenses, groups, and friends with natural language.
+**Talk to your Splitwise. Get CRED-grade spending analytics.**
 
-## Features
+ExpensifyAI is a Model Context Protocol (MCP) server for [Splitwise](https://www.splitwise.com/)
+that lets any LLM client (Claude, etc.) manage shared expenses **and** produce deterministic,
+premium spending analytics — category breakdowns, monthly trends, per-member comparisons, and
+minimum-transaction settlement plans — rendered as a self-contained, offline HTML dashboard.
+
+> Built on top of the excellent [tarunn2799/splitwise-mcp](https://github.com/tarunn2799/splitwise-mcp);
+> extended with a deterministic analytics engine and a category-first dashboard.
+
+![ExpensifyAI dashboard](examples/demo-dashboard.html)
+*(open `examples/demo-dashboard.html` in a browser — generated from synthetic data, no account needed)*
+
+## Analytics (what makes this ExpensifyAI)
+
+- **Deterministic by construction** — every number is computed in pure Python with `Decimal`
+  math (no float drift, no LLM estimation). Same input → byte-identical output. Each report
+  carries a **reconciliation check**: per-expense shares must sum to cost, or the mismatch is flagged.
+- **Category-first, à la CRED** — an expandable "where it goes" view leads every report; tap a
+  category to drill into its transactions.
+- **Seven analytics modules** — category breakdown · monthly trend · owed-vs-paid ("mine vs split")
+  · per-member comparison + category×member matrix · transaction ledger · top transactions ·
+  **settlement optimizer** (minimum transactions to settle a group — no other Splitwise tool has this).
+- **Premium offline dashboard** — CRED-grade dark UI, hand-rolled inline-SVG charts, validated
+  colorblind-safe palette, works with no network and no JS.
+- **Two tools** — `analyze_spending(target_type, target_id?, dates?, generate_dashboard?)` and
+  `compare_group_members(group_id, …)`. `target_type` is `me` | `group` | `friend`.
+
+Try it without an account:
+
+```bash
+python examples/generate_demo.py   # writes examples/demo-dashboard.html
+```
+
+## Features (MCP)
 
 - **Full API Access**: Manage expenses, groups, friends, and comments.
 - **Natural Language Resolution**: Fuzzy matching for names ("John" -> "John Smith") and groups.

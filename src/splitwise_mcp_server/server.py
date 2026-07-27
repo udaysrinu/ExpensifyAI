@@ -10,6 +10,8 @@ from .config import SplitwiseConfig
 from .auth import OAuth2Handler, APIKeyHandler
 from .client import SplitwiseClient
 from .resolver import EntityResolver
+from . import analytics as analytics_mod
+from . import dashboard as dashboard_mod
 from .errors import (
     ValidationError,
     RateLimitError,
@@ -117,7 +119,8 @@ def create_server() -> FastMCP:
     register_comment_tools(mcp)
     register_notification_tools(mcp)
     register_utility_tools(mcp)
-    
+    register_analytics_tools(mcp)
+
     logger.info("All tools registered successfully")
     
     return mcp
@@ -823,3 +826,157 @@ def register_utility_tools(mcp: FastMCP) -> None:
         except Exception as e:
             logger.error(f"Error getting currencies: {e}")
             raise
+
+
+# ============================================================================
+# Analytics Tools
+# ============================================================================
+
+async def _fetch_all_expenses(
+    group_id: Optional[int] = None,
+    friend_id: Optional[int] = None,
+    dated_after: Optional[str] = None,
+    dated_before: Optional[str] = None,
+    max_pages: int = 50,
+) -> Dict[str, Any]:
+    """Fetch every matching expense by paginating sequentially (100/page).
+
+    Sequential (never bursty) to stay under Splitwise's unpublished rate limit;
+    the client already honors 429 retry_after. Stops when a short page returns.
+    If max_pages is hit, flags truncated=True (logged) rather than silently
+    dropping transactions.
+    """
+    page_size = 100
+    all_expenses: List[Dict[str, Any]] = []
+    pages = 0
+    truncated = False
+    for page in range(max_pages):
+        pages += 1
+        resp = await client.get_expenses(
+            group_id=group_id,
+            friend_id=friend_id,
+            dated_after=dated_after,
+            dated_before=dated_before,
+            limit=page_size,
+            offset=page * page_size,
+        )
+        batch = resp.get("expenses", []) if isinstance(resp, dict) else []
+        all_expenses.extend(batch)
+        if len(batch) < page_size:
+            break
+    else:
+        truncated = True
+        logger.warning(f"Expense fetch hit max_pages={max_pages}; result truncated.")
+    return {"expenses": all_expenses, "pages_fetched": pages, "truncated": truncated}
+
+
+def register_analytics_tools(mcp: FastMCP) -> None:
+    """Register deterministic analytics tools (computed in Python, not by the LLM)."""
+
+    @mcp.tool()
+    async def analyze_spending(
+        target_type: str = "me",
+        target_id: Optional[int] = None,
+        dated_after: Optional[str] = None,
+        dated_before: Optional[str] = None,
+        generate_dashboard: bool = False,
+        top_n: int = 10,
+    ) -> Dict[str, Any]:
+        """Deterministic spending analytics for the current user, a group, or a friend.
+
+        All numbers are computed in Python (never estimated by the model): category
+        breakdown, monthly trend, owed-vs-paid ("mine vs split"), transaction ledger,
+        top transactions, and — for groups — per-member comparison, category×member
+        matrix, and a minimum-transaction settlement plan. Every result includes a
+        reconciliation check (shares must sum to cost) and a multi-currency guard.
+
+        target_type: "me" (all your expenses), "group" (needs target_id=group_id),
+                     or "friend" (needs target_id=friend user_id).
+        dated_after / dated_before: ISO 8601 date filters (optional).
+        generate_dashboard: if True, also writes a self-contained HTML dashboard and
+                            returns its file path in `dashboard_path`.
+        Perspective is always the authenticated user.
+        """
+        try:
+            validate_choice(target_type, "target_type", ["me", "group", "friend"])
+            if dated_after:
+                validate_date_format(dated_after, "dated_after")
+            if dated_before:
+                validate_date_format(dated_before, "dated_before")
+            if target_type in ("group", "friend") and target_id is None:
+                raise ValidationError(
+                    f"target_id is required when target_type is '{target_type}'",
+                    field="target_id",
+                )
+
+            me = (await client.get_current_user())["user"]
+            current_user_id = me["id"]
+
+            label = "My spending"
+            group_id = friend_id = None
+            if target_type == "group":
+                group_id = target_id
+                try:
+                    grp = (await client.get_group(target_id))["group"]
+                    label = grp.get("name", f"Group {target_id}")
+                except Exception:
+                    label = f"Group {target_id}"
+            elif target_type == "friend":
+                friend_id = target_id
+                try:
+                    fr = (await client.get_friend(target_id))["friend"]
+                    label = f"{fr.get('first_name','')} {fr.get('last_name','') or ''}".strip()
+                except Exception:
+                    label = f"Friend {target_id}"
+
+            fetched = await _fetch_all_expenses(
+                group_id=group_id, friend_id=friend_id,
+                dated_after=dated_after, dated_before=dated_before,
+            )
+
+            result = analytics_mod.compute_analytics(
+                fetched["expenses"],
+                current_user_id=current_user_id,
+                target_type=target_type,
+                target_id=target_id,
+                target_label=label,
+                top_n=top_n,
+                truncated=fetched["truncated"],
+                pages_fetched=fetched["pages_fetched"],
+            )
+
+            if generate_dashboard:
+                try:
+                    path = dashboard_mod.write_dashboard(result)
+                    result["dashboard_path"] = path
+                except Exception as e:
+                    logger.error(f"Dashboard write failed: {e}")
+                    result["dashboard_error"] = str(e)
+
+            logger.info(f"Analyzed {target_type} '{label}': {result['meta']['expense_count']} expenses")
+            return result
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error analyzing spending: {e}")
+            raise
+
+    @mcp.tool()
+    async def compare_group_members(
+        group_id: int,
+        dated_after: Optional[str] = None,
+        dated_before: Optional[str] = None,
+        generate_dashboard: bool = False,
+    ) -> Dict[str, Any]:
+        """Deterministic per-member comparison for a group: total spend + ranking,
+        category×member matrix, insights (highest/lowest/average/spread), and a
+        minimum-transaction settlement plan. Convenience wrapper over analyze_spending
+        with target_type='group'.
+        """
+        return await analyze_spending(
+            target_type="group",
+            target_id=group_id,
+            dated_after=dated_after,
+            dated_before=dated_before,
+            generate_dashboard=generate_dashboard,
+        )

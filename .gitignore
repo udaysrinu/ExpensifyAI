@@ -82,3 +82,10 @@ Thumbs.db
 
 # MCP specific
 mcp_cache/
+
+# ExpensifyAI — real financial reports (generated from your live account) must
+# never be committed. The synthetic demo under examples/ IS committed on purpose.
+analytics_reports/
+htmlcov/
+.coverage
+*.png

@@ -1,424 +1,73 @@
-"""Render an AnalyticsResult (from analytics.py) into a premium, self-contained HTML
-dashboard — CRED-grade dark aesthetic, category-first.
+"""Render an interactive, self-contained HTML dashboard from a Splitwise dataset.
 
-Deterministic and offline: no network, no clock, no CDN except the web-font link
-(the page still renders with system fallbacks if fonts are blocked). Charts are
-hand-rolled inline SVG. A small amount of dependency-free JS adds table search,
-sort, and the theme toggle; category drill-down uses native <details> so it works
-with JS disabled.
+CRED-grade dark aesthetic, category-first, and — new — INTERACTIVE: the page embeds
+the full transaction set (as integer paise) plus a client-side compute engine that
+mirrors analytics.py, so a date-range picker and quick presets re-filter and recompute
+the entire dashboard live in the browser. No server round-trip, no network, offline.
 
-Design language:
-  - pure near-black canvas, hairline dividers instead of heavy borders
-  - one accent (lime) used sparingly for emphasis + positive state; else monochrome
-  - oversized tabular numerals; generous whitespace
-  - category is the hero: expandable cards leading the page, drill into transactions
-  - staggered fade-up entrance; calm and dense after load
+Determinism: all client math is in integer paise (₹1 = 100), so there is no float
+drift — the same guarantee as Python's Decimal. A verify badge cross-checks the JS
+full-range total against a Python-computed reference baked into the dataset; on any
+mismatch it warns instead of showing wrong numbers. A <noscript> block explains the
+JS requirement (the interactive engine needs JS; the data itself is always embedded).
+
+Public API:
+  render_interactive(dataset)  -> HTML string   (dataset from analytics.build_dataset)
+  write_dashboard(dataset, ...) -> file path
 """
 
 from __future__ import annotations
 
 import html
-import math
-from decimal import Decimal
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-ACCENT = "#c6f24e"          # lime — the single accent
-POS = "#c6f24e"             # positive (others owe you) shares the accent
-NEG = "#ff8080"             # you owe / negative
-
-# Sequential lime ramp (light->dark) for category magnitude bars + donut.
-RAMP = ["#d7f877", "#c6f24e", "#a9d84f", "#8dbd4e",
-        "#72a24a", "#5a8743", "#456d3a", "#33532f", "#263f26"]
-MUTED = "#3a3a38"
+from typing import Any, Dict
 
 
 def _e(a: Any) -> str:
     return html.escape(str(a if a is not None else ""))
 
 
-def _ramp(i: int) -> str:
-    return RAMP[i] if i < len(RAMP) else MUTED
-
-
-def _fmt(amount: Any, currency: str = "", sign: bool = False) -> str:
-    """Indian-grouped money string, 2 decimals. sign=True prefixes + for positives."""
-    try:
-        d = Decimal(str(amount))
-    except Exception:
-        return _e(amount)
-    neg = d < 0
-    d = abs(d)
-    whole, frac = f"{d:.2f}".split(".")
-    if len(whole) > 3:
-        head, tail = whole[:-3], whole[-3:]
-        parts = []
-        while len(head) > 2:
-            parts.insert(0, head[-2:]); head = head[:-2]
-        if head:
-            parts.insert(0, head)
-        whole = ",".join(parts) + "," + tail
-    sym = "₹" if currency == "INR" else ("" if not currency else currency + " ")
-    pre = "-" if neg else ("+" if sign else "")
-    return f"{pre}{sym}{whole}.{frac}"
-
-
-# --- category icons (minimal inline line-SVG, keyword-matched) --------------
-
-def _icon(cat: str) -> str:
-    c = cat.lower()
-
-    def svg(p):
-        return (f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-                f'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{p}</svg>')
-    if any(k in c for k in ("grocer", "food", "dining", "restaurant")):
-        return svg('<path d="M3 2v7a3 3 0 0 0 6 0V2M6 2v20M21 15V2a5 5 0 0 0-3 5v6h3v7"/>')
-    if any(k in c for k in ("electric", "utilit", "power")):
-        return svg('<path d="M13 2 3 14h7l-1 8 10-12h-7z"/>')
-    if any(k in c for k in ("rent", "home", "house", "furnitur")):
-        return svg('<path d="M3 10 12 3l9 7v10a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>')
-    if any(k in c for k in ("clean", "household", "supplies")):
-        return svg('<path d="M6 3v6M4 9h4M12 3l1 5 4 12H8l4-12z"/>')
-    if any(k in c for k in ("tv", "phone", "internet", "wifi", "subscription", "spotify", "youtube")):
-        return svg('<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>')
-    if any(k in c for k in ("maint", "service", "repair")):
-        return svg('<path d="M14 6a3.5 3.5 0 0 1-4.6 4.6L4 16v4h4l5.4-5.4A3.5 3.5 0 0 1 18 10z"/>')
-    if any(k in c for k in ("transp", "travel", "taxi", "fuel", "car", "flight")):
-        return svg('<path d="M5 16 3 9h18l-2 7M5 16h14M7 16v3M17 16v3M6 9l1-4h10l1 4"/>')
-    if any(k in c for k in ("entertain", "movie", "game", "party", "beer", "drink")):
-        return svg('<path d="M5 4h14l-2 9H7zM12 13v5M8 21h8"/>')
-    return svg('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>')
-
-
-# ---------------------------------------------------------------------------
-# SVG charts
-# ---------------------------------------------------------------------------
-
-def _donut(categories, currency) -> str:
-    if not categories:
-        return "<p class='muted'>No category data.</p>"
-    total = sum(Decimal(c["amount"]) for c in categories) or Decimal("1")
-    cx, cy, r, w = 90, 90, 74, 20
-    circ = 2 * math.pi * (r - w / 2)
-    off = 0.0
-    shown, rest = categories[:8], categories[8:]
-    segs = []
-    for i, c in enumerate(shown):
-        frac = float(Decimal(c["amount"]) / total)
-        seg = circ * frac
-        segs.append(
-            f'<circle cx="{cx}" cy="{cy}" r="{r-w/2}" fill="none" stroke="{_ramp(i)}" '
-            f'stroke-width="{w}" stroke-dasharray="{seg:.3f} {circ-seg:.3f}" '
-            f'stroke-dashoffset="{-off:.3f}" transform="rotate(-90 {cx} {cy})">'
-            f'<title>{_e(c["category"])}: {_fmt(c["amount"],currency)} ({_e(c["percentage"])}%)</title></circle>'
-        )
-        off += seg
-    if rest:
-        ra = sum(Decimal(c["amount"]) for c in rest)
-        seg = circ * float(ra / total)
-        segs.append(
-            f'<circle cx="{cx}" cy="{cy}" r="{r-w/2}" fill="none" stroke="{MUTED}" '
-            f'stroke-width="{w}" stroke-dasharray="{seg:.3f} {circ-seg:.3f}" '
-            f'stroke-dashoffset="{-off:.3f}" transform="rotate(-90 {cx} {cy})"></circle>'
-        )
-    return (f'<svg viewBox="0 0 180 180" class="donut" role="img" aria-label="Category split">'
-            f'{"".join(segs)}</svg>')
-
-
-def _nice_ceiling(v: Decimal) -> Decimal:
-    if v <= 0:
-        return Decimal("1")
-    exp = len(str(int(v))) - 1
-    base = Decimal(10) ** exp
-    for m in (Decimal("1"), Decimal("2"), Decimal("2.5"), Decimal("5"), Decimal("10")):
-        if v <= m * base:
-            return m * base
-    return 10 * base
-
-
-def _monthly(months, currency) -> str:
-    if not months:
-        return "<p class='muted'>No monthly data.</p>"
-    vals = [Decimal(m["amount"]) for m in months]
-    mx = _nice_ceiling(max(vals) or Decimal("1"))
-    n = len(months)
-    W, H, pad_b, pad_t, pad_l = 660, 230, 44, 24, 4
-    plot = H - pad_b - pad_t
-    gap = 5 if n > 24 else 9
-    bw = max(3, (W - pad_l - (n + 1) * gap) / n)
-    show_vals = n <= 12
-    every = max(1, math.ceil(n / 16))
-    grid = []
-    for frac, val in ((0.0, Decimal(0)), (0.5, mx / 2), (1.0, mx)):
-        gy = pad_t + plot * (1 - frac)
-        grid.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{W}" y2="{gy:.1f}" class="grid"/>'
-                    f'<text x="{pad_l}" y="{gy-4:.1f}" class="gridlbl">{_fmt(str(val),currency)}</text>')
-    bars = []
-    for i, m in enumerate(months):
-        h = float((Decimal(m["amount"]) / mx) * plot) if mx else 0
-        x = pad_l + gap + i * (bw + gap)
-        y = H - pad_b - h
-        cx = x + bw / 2
-        bars.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" height="{h:.1f}" rx="2.5" '
-                    f'class="mbar"><title>{_e(m["month"])}: {_fmt(m["amount"],currency)} '
-                    f'({m["count"]} txns)</title></rect>')
-        if show_vals:
-            bars.append(f'<text x="{cx:.1f}" y="{y-6:.1f}" class="barval">{_fmt(m["amount"],currency)}</text>')
-        if i % every == 0:
-            bars.append(f'<text x="{cx:.1f}" y="{H-pad_b+13:.1f}" class="barlbl" '
-                        f'transform="rotate(45 {cx:.1f} {H-pad_b+13:.1f})">{_e(m["month"])}</text>')
-    return f'<svg viewBox="0 0 {W} {H}" class="bars" role="img" aria-label="Monthly spend">{"".join(grid)}{"".join(bars)}</svg>'
-
-
-# ---------------------------------------------------------------------------
-# Sections
-# ---------------------------------------------------------------------------
-
-def _hero_number(result, currency, is_group) -> str:
-    ovp = result["owed_vs_paid"]
-    net = Decimal(ovp["net"])
-    grand = result["category_breakdown"]["total"]
-    lead_label = "Total group spend" if is_group else "Your total spend"
-    net_cls = "pos" if net > 0 else ("neg" if net < 0 else "")
-    net_lbl = "others owe you" if net > 0 else ("you owe others" if net < 0 else "all settled")
-    return (
-        f'<section class="hero card">'
-        f'<div class="heromain"><div class="herolabel">{lead_label}</div>'
-        f'<div class="heronum">{_fmt(grand, currency)}</div></div>'
-        f'<div class="herostats">'
-        f'<div class="hs"><div class="hsv">{_fmt(ovp["personal_share"], currency)}</div><div class="hsk">your share</div></div>'
-        f'<div class="hs"><div class="hsv">{_fmt(ovp["you_paid"], currency)}</div><div class="hsk">you paid</div></div>'
-        f'<div class="hs {net_cls}"><div class="hsv">{_fmt(ovp["net"], currency, sign=True)}</div><div class="hsk">{net_lbl}</div></div>'
-        f'</div></section>'
-    )
-
-
-def _category_hero(result, currency) -> str:
-    cats = result["category_breakdown"]["categories"]
-    if not cats:
-        return ""
-    total = Decimal(result["category_breakdown"]["total"]) or Decimal("1")
-    # group ledger rows by category for drill-down (newest first)
-    by_cat: Dict[str, list] = {}
-    for row in reversed(result.get("ledger", [])):
-        by_cat.setdefault(row["category"], []).append(row)
-
-    cards = []
-    for i, c in enumerate(cats):
-        frac = float(Decimal(c["amount"]) / total)
-        txns = by_cat.get(c["category"], [])[:40]
-        rows = "".join(
-            f'<div class="ctx"><span class="ctxd">{_e(t["date"])}</span>'
-            f'<span class="ctxn">{_e(t["description"])}</span>'
-            f'<span class="ctxa num">{_fmt(t["amount"], currency)}</span></div>'
-            for t in txns
-        )
-        more = ""
-        full = by_cat.get(c["category"], [])
-        if len(full) > 40:
-            more = f'<div class="ctxmore">+{len(full)-40} more in this category</div>'
-        cards.append(
-            f'<details class="cat" style="--i:{i}">'
-            f'<summary>'
-            f'<span class="crow1">'
-            f'<span class="cicon" style="color:{_ramp(i)}">{_icon(c["category"])}</span>'
-            f'<span class="cmeta"><span class="cname">{_e(c["category"])}</span>'
-            f'<span class="ccount">{c["count"]} txns</span></span>'
-            f'<span class="cright"><span class="camt num">{_fmt(c["amount"], currency)}</span>'
-            f'<span class="cpct num">{_e(c["percentage"])}%</span></span>'
-            f'<span class="cchev">›</span>'
-            f'</span>'
-            f'<span class="cbar"><span class="cbarfill" style="width:{frac*100:.1f}%;background:{_ramp(i)}"></span></span>'
-            f'</summary>'
-            f'<div class="cbody">{rows}{more}</div>'
-            f'</details>'
-        )
-    donut = _donut(cats, currency)
-    return (
-        f'<section class="card cathero">'
-        f'<div class="sechead"><h2>Where it goes</h2>'
-        f'<span class="muted">tap a category to expand</span></div>'
-        f'<div class="catwrap"><div class="catlist">{"".join(cards)}</div>'
-        f'<div class="catdonut">{donut}<div class="donutcap"><div class="num">{_fmt(result["category_breakdown"]["total"], currency)}</div><span>total</span></div></div></div>'
-        f'</section>'
-    )
-
-
-def _member_bars(members, currency) -> str:
-    if not members:
-        return ""
-    mx = max((Decimal(m["total_share"]) for m in members), default=Decimal("1")) or Decimal("1")
-    rows = []
-    for i, m in enumerate(members):
-        frac = float(Decimal(m["total_share"]) / mx)
-        you = '<span class="youtag">you</span>' if m.get("is_you") else ""
-        col = ACCENT if m.get("is_you") else "#6a6a67"
-        rows.append(
-            f'<div class="mbrow"><div class="mbname">{_e(m["name"])}{you}</div>'
-            f'<div class="mbtrack"><div class="mbfill" style="width:{frac*100:.1f}%;background:{col}"></div></div>'
-            f'<div class="mbval num">{_fmt(m["total_share"], currency)}<span class="muted"> {_e(m["percentage_of_total"])}%</span></div></div>'
-        )
-    return f'<div class="mbars">{"".join(rows)}</div>'
-
-
-def _matrix(matrix, member_names, currency) -> str:
-    order = matrix.get("member_order", [])
-    if not order:
-        return ""
-    head = "<tr><th>Category</th>" + "".join(
-        f"<th class='num'>{_e(member_names.get(u, member_names.get(str(u), u)))}</th>" for u in order
-    ) + "<th class='num'>Total</th></tr>"
-    body = []
-    for row in matrix["rows"]:
-        cells = "".join(
-            f"<td class='num'>{_fmt(row['per_member'].get(str(u), row['per_member'].get(u, '0')), currency)}</td>"
-            for u in order
-        )
-        body.append(f"<tr><td>{_e(row['category'])}</td>{cells}<td class='num strong'>{_fmt(row['total'], currency)}</td></tr>")
-    return f'<div class="tablewrap"><table class="matrix"><thead>{head}</thead><tbody>{"".join(body)}</tbody></table></div>'
-
-
-def _settlement(settlement, currency) -> str:
-    txns = settlement.get("transactions", [])
-    if not txns:
-        return "<p class='muted'>Everyone is settled up.</p>"
-    items = "".join(
-        f'<li><span class="from">{_e(t["from_name"])}</span><span class="arrow">→</span>'
-        f'<span class="to">{_e(t["to_name"])}</span><span class="amt num">{_fmt(t["amount"], currency)}</span></li>'
-        for t in txns
-    )
-    return (f'<p class="muted">Minimum {settlement["transaction_count"]} transactions to settle up</p>'
-            f'<ul class="settle">{items}</ul>')
-
-
-def _top(top, currency) -> str:
-    if not top:
-        return ""
-    items = "".join(
-        f'<li><span class="rank num">{i+1}</span>'
-        f'<span class="tt-desc">{_e(t["description"])}</span>'
-        f'<span class="tt-cat">{_e(t["category"])}</span>'
-        f'<span class="tt-amt num">{_fmt(t["amount"], currency)}</span></li>'
-        for i, t in enumerate(top)
-    )
-    return f'<ol class="toplist">{items}</ol>'
-
-
-def _ledger(ledger, currency, max_rows=400) -> str:
-    if not ledger:
-        return "<p class='muted'>No transactions.</p>"
-    shown = list(reversed(ledger))[:max_rows]
-    note = ""
-    if len(ledger) > max_rows:
-        note = (f'<p class="muted">Showing the {max_rows} most recent of {len(ledger)} '
-                f'transactions — narrow the date range to load older ones.</p>')
-    head = ("<tr><th data-k='date'>Date</th><th data-k='description'>Description</th>"
-            "<th data-k='category'>Category</th><th data-k='cost' class='num'>Cost</th>"
-            "<th data-k='your_share' class='num'>Your share</th>"
-            "<th data-k='you_paid' class='num'>You paid</th></tr>")
-    rows = "".join(
-        f'<tr><td class="num">{_e(r["date"])}</td><td>{_e(r["description"])}</td>'
-        f'<td><span class="pill">{_e(r["category"])}</span></td>'
-        f'<td class="num">{_fmt(r["cost"], currency)}</td>'
-        f'<td class="num">{_fmt(r["your_share"], currency)}</td>'
-        f'<td class="num">{_fmt(r["you_paid"], currency)}</td></tr>'
-        for r in shown
-    )
-    return (f'{note}<input class="search" placeholder="Search {len(shown)} transactions…" oninput="ft(this)">'
-            f'<div class="tablewrap scroll"><table class="ledger" id="ledger"><thead>{head}</thead>'
-            f'<tbody>{rows}</tbody></table></div>')
-
-
-# ---------------------------------------------------------------------------
-# Page
-# ---------------------------------------------------------------------------
-
-def render(result: Dict[str, Any]) -> str:
-    meta = result.get("meta", {})
-    currency = meta.get("primary_currency", "")
-    is_group = meta.get("target_type") == "group"
+def render_interactive(dataset: Dict[str, Any]) -> str:
+    meta = dataset.get("meta", {})
     label = meta.get("target_label") or "Analysis"
-
-    if result.get("empty"):
-        body = ('<section class="card"><h2>No expenses</h2>'
-                '<p class="muted">No transactions matched the selected filters.</p></section>')
-        return _page(label, body)
-
-    span = f'{_e(meta.get("date_from"))} — {_e(meta.get("date_to"))}' if meta.get("date_from") else ""
-    warn = ""
-    if meta.get("mixed_currency"):
-        warn += f'<div class="warn">Mixed currencies ({", ".join(meta.get("currencies", []))}) — totals shown per currency, not summed.</div>'
-    if meta.get("truncated"):
-        warn += f'<div class="warn">Result truncated at {meta.get("pages_fetched")} pages — not all transactions included.</div>'
-    rec = result.get("reconciliation", {})
-    if rec and not rec.get("reconciled", True):
-        warn += '<div class="warn err">Reconciliation mismatch — shares do not sum to cost. Numbers may be off.</div>'
-
-    parts = [
-        f'<div class="subhead"><span class="num">{_e(meta.get("expense_count"))} transactions</span>'
-        f'{f"<span>{span}</span>" if span else ""}'
-        f'{"<span class=ok>reconciled</span>" if rec.get("reconciled") else ""}</div>{warn}',
-        _hero_number(result, currency, is_group),
-        _category_hero(result, currency),
-        f'<section class="card"><div class="sechead"><h2>Monthly trend</h2></div>{_monthly(result["monthly_trend"]["months"], currency)}</section>',
-    ]
-
-    if is_group and "member_comparison" in result:
-        mc = result["member_comparison"]
-        ins = mc.get("insights", {})
-        ins_html = ""
-        if ins:
-            ins_html = (f'<div class="insights">'
-                        f'<span>avg/person <b class="num">{_fmt(ins["average_per_member"], currency)}</b></span>'
-                        f'<span>top <b>{_e(ins["highest_spender"]["name"])}</b></span></div>')
-        parts.append(f'<section class="card"><div class="sechead"><h2>Members</h2></div>{ins_html}{_member_bars(mc["members"], currency)}</section>')
-        parts.append(f'<section class="card"><div class="sechead"><h2>Category × member</h2></div>{_matrix(result["category_matrix"], mc.get("member_names", {}), currency)}</section>')
-        parts.append(f'<section class="card"><div class="sechead"><h2>Settle up</h2></div>{_settlement(result["settlement"], currency)}</section>')
-
-    parts.append(f'<section class="card"><div class="sechead"><h2>Top transactions</h2></div>{_top(result["top_transactions"], currency)}</section>')
-    parts.append(f'<section class="card"><div class="sechead"><h2>All transactions</h2></div>{_ledger(result["ledger"], currency)}</section>')
-
-    return _page(label, "".join(parts))
+    # Embed dataset safely inside a <script type="application/json"> block.
+    payload = json.dumps(dataset, separators=(",", ":"), ensure_ascii=False)
+    payload = payload.replace("</", "<\\/")  # guard against </script> injection
+    return _PAGE.replace("__LABEL__", _e(label)).replace("__DATA__", payload)
 
 
-def _page(label: str, body: str) -> str:
-    return f"""<!DOCTYPE html>
+# Back-compat alias — analytics tool / demo call this.
+def render(dataset_or_result: Dict[str, Any]) -> str:
+    return render_interactive(dataset_or_result)
+
+
+def write_dashboard(dataset: Dict[str, Any], out_dir: str = "analytics_reports") -> str:
+    meta = dataset.get("meta", {})
+    tgt, tid = meta.get("target_type", "analysis"), meta.get("target_id")
+    slug = f"{tgt}{('-'+str(tid)) if tid else ''}".replace(":", "").replace(" ", "_")
+    p = Path(out_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    fp = p / f"{slug}.html"
+    fp.write_text(render_interactive(dataset), encoding="utf-8")
+    return str(fp.resolve())
+
+
+# ============================================================================
+# The page: HTML shell + CSS + the JS compute/render engine.
+# __DATA__ is replaced with the embedded dataset; __LABEL__ with the title.
+# ============================================================================
+
+_PAGE = r"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ExpensifyAI — {_e(label)}</title>
+<title>ExpensifyAI — __LABEL__</title>
 <link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>{_CSS}</style>
-</head>
-<body class="viz-root">
-<header class="topbar">
-  <div class="brandwrap"><span class="dot"></span><div>
-    <div class="brand">EXPENSIFY&nbsp;AI</div>
-    <h1>{_e(label)}</h1></div></div>
-  <button class="toggle" onclick="tt()" aria-label="Toggle theme">◐</button>
-</header>
-<main>{body}</main>
-<footer><p class="muted">Automated report by ExpensifyAI · deterministic compute · if any doubt, reach out to Uday.</p></footer>
-<script>{_JS}</script>
-</body></html>"""
-
-
-def write_dashboard(result: Dict[str, Any], out_dir: str = "analytics_reports") -> str:
-    meta = result.get("meta", {})
-    tgt, tid = meta.get("target_type", "analysis"), meta.get("target_id")
-    frm, to = (meta.get("date_from") or "all"), (meta.get("date_to") or "all")
-    slug = f"{tgt}{('-'+str(tid)) if tid else ''}-{frm}-to-{to}".replace(":", "").replace(" ", "_")
-    path = Path(out_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    fp = path / f"{slug}.html"
-    fp.write_text(render(result), encoding="utf-8")
-    return str(fp.resolve())
-
-
-_CSS = """
+<style>
 :root{
   --bg:#08080a;--surf:#101013;--surf2:#17171b;--hair:rgba(255,255,255,.06);
   --tx:#f4f4f0;--tx2:#93938d;--tx3:#5a5a56;--accent:#c6f24e;--pos:#c6f24e;--neg:#ff8080;
@@ -428,7 +77,7 @@ _CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
 body{background:var(--bg);color:var(--tx);font-family:var(--font);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;
-  background-image:radial-gradient(120% 90% at 50% -10%, rgba(198,242,78,.05), transparent 55%);background-attachment:fixed;}
+  background-image:radial-gradient(120% 90% at 50% -10%, rgba(198,242,78,.05), transparent 55%);background-attachment:fixed;min-height:100vh}
 .num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
 .muted{color:var(--tx3);font-size:13px}
 .topbar{display:flex;justify-content:space-between;align-items:center;padding:26px 34px;position:sticky;top:0;z-index:20;
@@ -439,40 +88,44 @@ body{background:var(--bg);color:var(--tx);font-family:var(--font);font-size:15px
 h1{font:700 22px/1.1 var(--display);letter-spacing:-.02em;margin-top:3px}
 .toggle{width:40px;height:40px;border-radius:12px;border:1px solid var(--hair);background:var(--surf);color:var(--tx2);cursor:pointer;font-size:16px}
 .toggle:hover{color:var(--accent)}
-main{max-width:1080px;margin:0 auto;padding:28px 34px 12px;display:flex;flex-direction:column;gap:18px}
-.subhead{display:flex;gap:18px;align-items:center;color:var(--tx2);font-size:13px;flex-wrap:wrap;padding:0 4px}
+main{max-width:1080px;margin:0 auto;padding:22px 34px 12px;display:flex;flex-direction:column;gap:18px}
+
+/* filter bar */
+.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:14px 18px;background:var(--surf);border:1px solid var(--hair);border-radius:16px;position:sticky;top:82px;z-index:15}
+.presets{display:flex;gap:6px}
+.chip{padding:7px 13px;border-radius:100px;border:1px solid var(--hair);background:transparent;color:var(--tx2);cursor:pointer;font:600 12.5px var(--font)}
+.chip:hover{color:var(--tx)}
+.chip.active{background:var(--accent);color:#0a0a0a;border-color:var(--accent)}
+.daterange{display:flex;gap:8px;align-items:center;margin-left:auto;color:var(--tx3);font-size:12.5px}
+.daterange input{background:var(--surf2);border:1px solid var(--hair);border-radius:10px;color:var(--tx);padding:7px 10px;font:500 13px var(--font);color-scheme:dark}
+[data-theme=light] .daterange input{color-scheme:light}
+.reset{background:none;border:none;color:var(--tx3);cursor:pointer;font-size:12.5px;text-decoration:underline}
+.reset:hover{color:var(--accent)}
+
+.subhead{display:flex;gap:16px;align-items:center;color:var(--tx2);font-size:13px;flex-wrap:wrap;padding:0 4px}
 .subhead .ok{color:var(--accent)}
 .subhead .ok::before{content:"● ";font-size:9px;vertical-align:middle}
+.subhead .bad{color:var(--neg)}
 .warn{background:rgba(255,128,128,.09);border:1px solid rgba(255,128,128,.28);color:#ffb0b0;padding:11px 16px;border-radius:12px;font-size:13.5px}
-.warn.err{background:rgba(255,80,80,.12)}
-
-.card{background:var(--surf);border:1px solid var(--hair);border-radius:var(--radius);padding:26px 28px;
-  animation:rise .6s cubic-bezier(.2,.7,.3,1) both}
-main>.card:nth-child(2){animation-delay:.04s}main>.card:nth-child(3){animation-delay:.1s}
-main>.card:nth-child(4){animation-delay:.16s}main>.card:nth-child(5){animation-delay:.22s}
-main>.card:nth-child(6){animation-delay:.28s}main>.card:nth-child(n+7){animation-delay:.34s}
-@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+.card{background:var(--surf);border:1px solid var(--hair);border-radius:var(--radius);padding:26px 28px;animation:rise .5s cubic-bezier(.2,.7,.3,1) both}
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 @media(prefers-reduced-motion:reduce){.card{animation:none}}
 .sechead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px}
 h2{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;color:var(--tx2)}
 
-/* hero */
-.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;flex-wrap:wrap;
-  background:linear-gradient(150deg,var(--surf),var(--surf2))}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;flex-wrap:wrap;background:linear-gradient(150deg,var(--surf),var(--surf2))}
 .herolabel{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;color:var(--tx2);margin-bottom:12px}
 .heronum{font:800 56px/1 var(--display);letter-spacing:-.03em}
 .herostats{display:flex;gap:34px}
 .hs .hsv{font:700 22px/1 var(--display);letter-spacing:-.02em}
-.hs .hsk{font-size:12px;color:var(--tx3);margin-top:6px;letter-spacing:.02em}
+.hs .hsk{font-size:12px;color:var(--tx3);margin-top:6px}
 .hs.pos .hsv{color:var(--pos)}.hs.neg .hsv{color:var(--neg)}
-@media(max-width:720px){.heronum{font-size:42px}.herostats{gap:22px}}
+@media(max-width:720px){.heronum{font-size:40px}.herostats{gap:20px}}
 
-/* category hero */
 .catwrap{display:grid;grid-template-columns:1fr 200px;gap:30px;align-items:start}
 @media(max-width:760px){.catwrap{grid-template-columns:1fr}.catdonut{order:-1;justify-self:center}}
 .catlist{display:flex;flex-direction:column}
-.cat{border-bottom:1px solid var(--hair)}
-.cat:last-child{border-bottom:none}
+.cat{border-bottom:1px solid var(--hair)}.cat:last-child{border-bottom:none}
 .cat summary{list-style:none;cursor:pointer;padding:15px 2px;display:flex;flex-direction:column;gap:9px}
 .cat summary::-webkit-details-marker{display:none}
 .crow1{display:flex;align-items:center;gap:14px}
@@ -484,12 +137,11 @@ h2{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;col
 .cright{text-align:right;display:flex;flex-direction:column;gap:2px;flex:none}
 .camt{font:700 16px/1 var(--display)}
 .cpct{font-size:12px;color:var(--tx3)}
-.cbar{height:3px;border-radius:3px;background:var(--surf2);overflow:hidden;margin-left:48px}
-.cbarfill{display:block;height:100%;border-radius:3px}
 .cchev{color:var(--tx3);font-size:20px;transition:transform .25s;flex:none}
 .cat[open] .cchev{transform:rotate(90deg);color:var(--accent)}
-.cbody{padding:4px 2px 16px 48px;display:flex;flex-direction:column;animation:fade .3s ease both}
-@keyframes fade{from{opacity:0}to{opacity:1}}
+.cbar{height:3px;border-radius:3px;background:var(--surf2);overflow:hidden;margin-left:48px}
+.cbarfill{display:block;height:100%;border-radius:3px}
+.cbody{padding:4px 2px 16px 48px;display:flex;flex-direction:column}
 .ctx{display:grid;grid-template-columns:88px 1fr auto;gap:14px;padding:8px 0;border-top:1px solid var(--hair);font-size:13.5px}
 .ctxd{color:var(--tx3);font-variant-numeric:tabular-nums}
 .ctxn{color:var(--tx2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -498,10 +150,9 @@ h2{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;col
 .catdonut{position:relative;width:180px;height:180px}
 .donut{width:180px;height:180px}
 .donutcap{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
-.donutcap .num{font:700 17px/1 var(--display);letter-spacing:-.02em}
+.donutcap .num{font:700 16px/1 var(--display);letter-spacing:-.02em;text-align:center;padding:0 10px}
 .donutcap span{font-size:11px;color:var(--tx3);text-transform:uppercase;letter-spacing:.1em;margin-top:3px}
 
-/* charts */
 .bars{width:100%;height:auto}
 .mbar{fill:var(--accent);opacity:.85}.mbar:hover{opacity:1}
 .grid{stroke:var(--hair)}
@@ -509,7 +160,6 @@ h2{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;col
 .barval{fill:var(--tx2);font-size:9.5px;text-anchor:middle;font-variant-numeric:tabular-nums}
 .barlbl{fill:var(--tx3);font-size:10px;text-anchor:start}
 
-/* members */
 .insights{display:flex;gap:24px;margin-bottom:18px;font-size:13.5px;color:var(--tx2)}
 .insights b{color:var(--tx);font-weight:600}
 .mbars{display:flex;flex-direction:column;gap:12px}
@@ -520,21 +170,18 @@ h2{font:600 12px/1 var(--font);letter-spacing:.14em;text-transform:uppercase;col
 .mbfill{height:100%;border-radius:5px}
 .mbval{text-align:right;font-size:14px;font-weight:600}
 
-/* tables */
 .tablewrap{overflow-x:auto}
 .tablewrap.scroll{max-height:560px;overflow-y:auto;border:1px solid var(--hair);border-radius:12px}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
-thead th{position:sticky;top:0;background:var(--surf);text-align:left;color:var(--tx3);font-weight:600;
-  padding:11px 14px;border-bottom:1px solid var(--hair);cursor:pointer;white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+thead th{position:sticky;top:0;background:var(--surf);text-align:left;color:var(--tx3);font-weight:600;padding:11px 14px;border-bottom:1px solid var(--hair);cursor:pointer;white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
 td{padding:10px 14px;border-bottom:1px solid var(--hair)}
 tbody tr:last-child td{border-bottom:none}
-.num{text-align:right}th.num,td.num{text-align:right}
+th.num,td.num{text-align:right}
 .strong{font-weight:700}
 tbody tr:hover{background:var(--surf2)}
 .pill{background:var(--surf2);border:1px solid var(--hair);border-radius:100px;padding:2px 10px;font-size:12px;color:var(--tx2)}
 .search{width:100%;padding:12px 16px;margin-bottom:14px;background:var(--surf2);border:1px solid var(--hair);border-radius:12px;color:var(--tx);font-size:14px;font-family:var(--font)}
 .search:focus{outline:none;border-color:var(--accent)}
-
 .settle{list-style:none;display:flex;flex-direction:column;gap:9px;margin-top:6px}
 .settle li{display:flex;align-items:center;gap:12px;background:var(--surf2);padding:12px 16px;border-radius:12px}
 .settle .from{color:var(--neg)}.settle .to{color:var(--pos)}.settle .arrow{color:var(--tx3)}
@@ -545,18 +192,249 @@ tbody tr:hover{background:var(--surf2)}
 .rank{width:24px;color:var(--tx3);font-weight:700;font-size:13px}
 .tt-desc{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tt-cat{color:var(--tx3);font-size:12.5px}.tt-amt{font-weight:700}
+.empty{text-align:center;padding:40px;color:var(--tx3)}
 footer{max-width:1080px;margin:0 auto;padding:26px 34px 40px;text-align:center}
-"""
+noscript{display:block;padding:16px;background:var(--surf);border:1px solid var(--hair);border-radius:12px;color:var(--tx2);margin:18px 34px}
+</style>
+</head>
+<body class="viz-root">
+<header class="topbar">
+  <div class="brandwrap"><span class="dot"></span><div>
+    <div class="brand">EXPENSIFY&nbsp;AI</div>
+    <h1 id="title">__LABEL__</h1></div></div>
+  <button class="toggle" onclick="TT()" aria-label="Toggle theme">◐</button>
+</header>
 
-_JS = """
-function tt(){var h=document.documentElement;h.dataset.theme=h.dataset.theme==='dark'?'light':'dark';}
-function ft(i){var q=i.value.toLowerCase();document.querySelectorAll('#ledger tbody tr').forEach(function(r){
-  r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}
-document.querySelectorAll('th[data-k]').forEach(function(th){th.addEventListener('click',function(){
-  var tb=th.closest('table').querySelector('tbody'),idx=[].indexOf.call(th.parentNode.children,th),asc=th.dataset.asc!=='1';
-  th.dataset.asc=asc?'1':'0';var rows=[].slice.call(tb.querySelectorAll('tr'));
-  rows.sort(function(a,b){var x=a.children[idx].textContent.trim(),y=b.children[idx].textContent.trim();
-    var nx=parseFloat(x.replace(/[^0-9.-]/g,'')),ny=parseFloat(y.replace(/[^0-9.-]/g,''));
-    if(!isNaN(nx)&&!isNaN(ny))return asc?nx-ny:ny-nx;return asc?x.localeCompare(y):y.localeCompare(x);});
-  rows.forEach(function(r){tb.appendChild(r);});});});
-"""
+<noscript>This interactive dashboard needs JavaScript to filter and recompute in the browser. Your data is embedded in the page; enable JavaScript to view the charts and filters.</noscript>
+
+<main id="app" style="display:none">
+  <div class="filters">
+    <div class="presets" id="presets">
+      <button class="chip" data-r="1m">This month</button>
+      <button class="chip" data-r="3m">3 months</button>
+      <button class="chip" data-r="6m">6 months</button>
+      <button class="chip" data-r="ytd">This year</button>
+      <button class="chip active" data-r="all">All time</button>
+    </div>
+    <div class="daterange">
+      <span>from</span><input type="date" id="from">
+      <span>to</span><input type="date" id="to">
+      <button class="reset" onclick="RESET()">reset</button>
+    </div>
+  </div>
+  <div id="subhead" class="subhead"></div>
+  <div id="warns"></div>
+  <div id="sections"></div>
+</main>
+<footer><p class="muted">Automated report by ExpensifyAI · deterministic compute (integer paise) · if any doubt, reach out to Uday.</p></footer>
+
+<script type="application/json" id="dataset">__DATA__</script>
+<script>
+const DATA = JSON.parse(document.getElementById('dataset').textContent);
+const META = DATA.meta, NAMES = DATA.names, ALL = DATA.expenses;
+const ME = META.current_user_id, IS_GROUP = META.target_type === 'group';
+const CUR = META.primary_currency;
+document.getElementById('app').style.display = '';
+
+/* ---------- money: integer paise, exact ---------- */
+function fmt(p, sign){ // p = paise int
+  let neg = p < 0; p = Math.abs(p);
+  let r = Math.round(p), whole = Math.floor(r/100), frac = String(r%100).padStart(2,'0');
+  let s = String(whole), out;
+  if (s.length > 3){ let head = s.slice(0,-3), tail = s.slice(-3), parts=[];
+    while(head.length>2){parts.unshift(head.slice(-2));head=head.slice(0,-2);} if(head)parts.unshift(head);
+    out = parts.join(',')+','+tail; } else out = s;
+  let sym = CUR==='INR'?'₹':(CUR?CUR+' ':'');
+  return (neg?'-':(sign?'+':''))+sym+out+'.'+frac;
+}
+function pct(part, whole){ if(!whole) return '0.0'; return (Math.round(part/whole*1000)/10).toFixed(1); }
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------- ramp + icons ---------- */
+const RAMP=["#d7f877","#c6f24e","#a9d84f","#8dbd4e","#72a24a","#5a8743","#456d3a","#33532f","#263f26"], MUTED="#3a3a38";
+const ramp=i=>i<RAMP.length?RAMP[i]:MUTED;
+function icon(cat){const c=cat.toLowerCase();const S=p=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  if(/grocer|food|dining|restaurant/.test(c))return S('<path d="M3 2v7a3 3 0 0 0 6 0V2M6 2v20M21 15V2a5 5 0 0 0-3 5v6h3v7"/>');
+  if(/electric|utilit|power/.test(c))return S('<path d="M13 2 3 14h7l-1 8 10-12h-7z"/>');
+  if(/rent|home|house|furnitur/.test(c))return S('<path d="M3 10 12 3l9 7v10a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>');
+  if(/clean|household|supplies/.test(c))return S('<path d="M6 3v6M4 9h4M12 3l1 5 4 12H8l4-12z"/>');
+  if(/tv|phone|internet|wifi|subscription|spotify|youtube/.test(c))return S('<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>');
+  if(/maint|service|repair/.test(c))return S('<path d="M14 6a3.5 3.5 0 0 1-4.6 4.6L4 16v4h4l5.4-5.4A3.5 3.5 0 0 1 18 10z"/>');
+  if(/transp|travel|taxi|fuel|car|flight/.test(c))return S('<path d="M5 16 3 9h18l-2 7M5 16h14M7 16v3M17 16v3M6 9l1-4h10l1 4"/>');
+  if(/entertain|movie|game|party|beer|drink/.test(c))return S('<path d="M5 4h14l-2 9H7zM12 13v5M8 21h8"/>');
+  return S('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>');}
+
+/* ---------- compute engine (mirrors analytics.py, integer paise) ---------- */
+function owed(e,uid){const s=e.shares[uid];return s?s[1]:0;}
+function paid(e,uid){const s=e.shares[uid];return s?s[0]:0;}
+function amountOf(e){return IS_GROUP?e.cost:owed(e,ME);}
+
+function compute(rows){
+  const catT={},catC={},monT={},monC={}; let myOwed=0,myPaid=0,grand=0;
+  const memOwed={},memPaid={},net={},names={},matrix={},cats=new Set();
+  for(const e of rows){
+    const a=amountOf(e);
+    catT[e.cat]=(catT[e.cat]||0)+a; catC[e.cat]=(catC[e.cat]||0)+1; grand+=a;
+    monT[e.month]=(monT[e.month]||0)+a; monC[e.month]=(monC[e.month]||0)+1;
+    myOwed+=owed(e,ME); myPaid+=paid(e,ME);
+    cats.add(e.cat);
+    for(const uid in e.shares){const[p,o]=e.shares[uid];
+      names[uid]=NAMES[uid]||('User '+uid);
+      memOwed[uid]=(memOwed[uid]||0)+o; memPaid[uid]=(memPaid[uid]||0)+p; net[uid]=(net[uid]||0)+(p-o);
+      const k=e.cat+'|@|'+uid; matrix[k]=(matrix[k]||0)+o;}
+  }
+  const categories=Object.keys(catT).map(c=>({category:c,amount:catT[c],count:catC[c]}))
+    .sort((x,y)=>y.amount-x.amount||(x.category<y.category?-1:1));
+  const months=Object.keys(monT).sort().map(m=>({month:m,amount:monT[m],count:monC[m]}));
+  const net_=myPaid-myOwed;
+  const res={grand,categories,months,ovp:{share:myOwed,paid:myPaid,net:net_},
+    ledger:rows.slice().sort((a,b)=>(a.date<b.date?-1:a.date>b.date?1:0)||((a.id||0)-(b.id||0))),
+    top:rows.slice().sort((a,b)=>amountOf(b)-amountOf(a)||(a.date<b.date?-1:1)).slice(0,10)};
+  if(IS_GROUP){
+    const ids=Object.keys(memOwed).sort((a,b)=>memOwed[b]-memOwed[a]||(names[a]<names[b]?-1:1));
+    const members=ids.map((uid,i)=>{
+      let tc='N/A',tv=-1; for(const c of cats){const v=matrix[c+'|@|'+uid]||0; if(v>tv){tv=v;tc=c;}}
+      return{uid,name:names[uid],is_you:+uid===ME,share:memOwed[uid],paid:memPaid[uid],net:net[uid],
+        pct:pct(memOwed[uid],grand),top_cat:tc};});
+    const ordCats=[...cats].sort((a,b)=>{let sa=0,sb=0;for(const u of ids){sa+=matrix[a+'|@|'+u]||0;sb+=matrix[b+'|@|'+u]||0;}return sb-sa||(a<b?-1:1);});
+    const mrows=ordCats.map(c=>{const per={};let t=0;for(const u of ids){const v=matrix[c+'|@|'+u]||0;per[u]=v;t+=v;}return{category:c,per,total:t};});
+    // settlement (greedy min cash flow)
+    const cr=ids.filter(u=>net[u]>0).map(u=>[u,net[u]]).sort((a,b)=>b[1]-a[1]||(a[0]-b[0]));
+    const de=ids.filter(u=>net[u]<0).map(u=>[u,-net[u]]).sort((a,b)=>b[1]-a[1]||(a[0]-b[0]));
+    const tx=[];let i=0,j=0;
+    while(i<cr.length&&j<de.length){const pay=Math.min(cr[i][1],de[j][1]);
+      tx.push({from:de[j][0],to:cr[i][0],amt:pay});cr[i][1]-=pay;de[j][1]-=pay;
+      if(cr[i][1]===0)i++; if(de[j][1]===0)j++;}
+    const totals=ids.map(u=>memOwed[u]);
+    res.members=members;res.mrows=mrows;res.mids=ids;res.mnames=names;res.settle=tx;
+    res.insights={avg:ids.length?Math.round(grand/ids.length):0,top:members[0],
+      low:members[members.length-1],spread:totals.length?totals[0]-totals[totals.length-1]:0};
+  }
+  return res;
+}
+
+/* ---------- SVG charts ---------- */
+function donut(cats,grand){
+  if(!cats.length)return"<p class='muted'>No data.</p>";
+  const cx=90,cy=90,r=74,w=20,circ=2*Math.PI*(r-w/2);let off=0,segs='';
+  const shown=cats.slice(0,8),rest=cats.slice(8);
+  shown.forEach((c,i)=>{const f=c.amount/(grand||1),seg=circ*f;
+    segs+=`<circle cx="${cx}" cy="${cy}" r="${r-w/2}" fill="none" stroke="${ramp(i)}" stroke-width="${w}" stroke-dasharray="${seg.toFixed(3)} ${(circ-seg).toFixed(3)}" stroke-dashoffset="${(-off).toFixed(3)}" transform="rotate(-90 ${cx} ${cy})"><title>${esc(c.category)}: ${fmt(c.amount)}</title></circle>`;off+=seg;});
+  if(rest.length){const ra=rest.reduce((s,c)=>s+c.amount,0),seg=circ*(ra/(grand||1));
+    segs+=`<circle cx="${cx}" cy="${cy}" r="${r-w/2}" fill="none" stroke="${MUTED}" stroke-width="${w}" stroke-dasharray="${seg.toFixed(3)} ${(circ-seg).toFixed(3)}" stroke-dashoffset="${(-off).toFixed(3)}" transform="rotate(-90 ${cx} ${cy})"></circle>`;}
+  return `<svg viewBox="0 0 180 180" class="donut" role="img" aria-label="Category split">${segs}</svg>`;
+}
+function niceCeil(v){if(v<=0)return 1;const exp=String(Math.floor(v)).length-1,base=Math.pow(10,exp);
+  for(const m of[1,2,2.5,5,10])if(v<=m*base)return m*base;return 10*base;}
+function monthly(months){
+  if(!months.length)return"<p class='muted'>No data.</p>";
+  const mx=niceCeil(Math.max(...months.map(m=>m.amount))||1),n=months.length;
+  const W=660,H=230,pb=44,pt=24,pl=4,plot=H-pb-pt,gap=n>24?5:9,bw=Math.max(3,(W-pl-(n+1)*gap)/n);
+  const showVals=n<=12,every=Math.max(1,Math.ceil(n/16));let g='';
+  [[0,0],[.5,mx/2],[1,mx]].forEach(([f,val])=>{const gy=pt+plot*(1-f);
+    g+=`<line x1="${pl}" y1="${gy.toFixed(1)}" x2="${W}" y2="${gy.toFixed(1)}" class="grid"/><text x="${pl}" y="${(gy-4).toFixed(1)}" class="gridlbl">${fmt(val)}</text>`;});
+  let b='';months.forEach((m,i)=>{const h=mx?(m.amount/mx)*plot:0,x=pl+gap+i*(bw+gap),y=H-pb-h,cx=x+bw/2;
+    b+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2.5" class="mbar"><title>${esc(m.month)}: ${fmt(m.amount)} (${m.count} txns)</title></rect>`;
+    if(showVals)b+=`<text x="${cx.toFixed(1)}" y="${(y-6).toFixed(1)}" class="barval">${fmt(m.amount)}</text>`;
+    if(i%every===0)b+=`<text x="${cx.toFixed(1)}" y="${(H-pb+13).toFixed(1)}" class="barlbl" transform="rotate(45 ${cx.toFixed(1)} ${(H-pb+13).toFixed(1)})">${esc(m.month)}</text>`;});
+  return `<svg viewBox="0 0 ${W} ${H}" class="bars" role="img" aria-label="Monthly spend">${g}${b}</svg>`;
+}
+
+/* ---------- section renderers ---------- */
+function heroSection(R){
+  const net=R.ovp.net,cls=net>0?'pos':net<0?'neg':'',lbl=net>0?'others owe you':net<0?'you owe others':'all settled';
+  return `<section class="card hero"><div><div class="herolabel">${IS_GROUP?'Total group spend':'Your total spend'}</div>
+    <div class="heronum num">${fmt(R.grand)}</div></div><div class="herostats">
+    <div class="hs"><div class="hsv num">${fmt(R.ovp.share)}</div><div class="hsk">your share</div></div>
+    <div class="hs"><div class="hsv num">${fmt(R.ovp.paid)}</div><div class="hsk">you paid</div></div>
+    <div class="hs ${cls}"><div class="hsv num">${fmt(net,true)}</div><div class="hsk">${lbl}</div></div></div></section>`;
+}
+function catSection(R){
+  const byCat={};for(const e of R.ledger.slice().reverse()){(byCat[e.cat]=byCat[e.cat]||[]).push(e);}
+  let cards='';R.categories.forEach((c,i)=>{const f=c.amount/(R.grand||1),txns=(byCat[c.category]||[]).slice(0,40);
+    let rows='';txns.forEach(t=>{rows+=`<div class="ctx"><span class="ctxd">${esc(t.date)}</span><span class="ctxn">${esc(t.desc)}</span><span class="ctxa num">${fmt(amountOf(t))}</span></div>`;});
+    const full=byCat[c.category]||[];const more=full.length>40?`<div class="ctxmore">+${full.length-40} more</div>`:'';
+    cards+=`<details class="cat"><summary><span class="crow1"><span class="cicon" style="color:${ramp(i)}">${icon(c.category)}</span><span class="cmeta"><span class="cname">${esc(c.category)}</span><span class="ccount">${c.count} txns</span></span><span class="cright"><span class="camt num">${fmt(c.amount)}</span><span class="cpct num">${pct(c.amount,R.grand)}%</span></span><span class="cchev">›</span></span><span class="cbar"><span class="cbarfill" style="width:${(f*100).toFixed(1)}%;background:${ramp(i)}"></span></span></summary><div class="cbody">${rows}${more}</div></details>`;});
+  return `<section class="card"><div class="sechead"><h2>Where it goes</h2><span class="muted">tap a category to expand</span></div>
+    <div class="catwrap"><div class="catlist">${cards}</div><div class="catdonut">${donut(R.categories,R.grand)}<div class="donutcap"><div class="num">${fmt(R.grand)}</div><span>total</span></div></div></div></section>`;
+}
+function monthlySection(R){return `<section class="card"><div class="sechead"><h2>Monthly trend</h2></div>${monthly(R.months)}</section>`;}
+function memberSection(R){
+  if(!R.members)return'';const mx=Math.max(...R.members.map(m=>m.share),1);
+  let rows='';R.members.forEach((m,i)=>{const f=m.share/mx,col=m.is_you?'var(--accent)':'#6a6a67',you=m.is_you?'<span class="youtag">you</span>':'';
+    rows+=`<div class="mbrow"><div class="mbname">${esc(m.name)}${you}</div><div class="mbtrack"><div class="mbfill" style="width:${(f*100).toFixed(1)}%;background:${col}"></div></div><div class="mbval num">${fmt(m.share)}<span class="muted"> ${m.pct}%</span></div></div>`;});
+  const ins=R.insights?`<div class="insights"><span>avg/person <b class="num">${fmt(R.insights.avg)}</b></span><span>top <b>${esc(R.insights.top.name)}</b></span></div>`:'';
+  return `<section class="card"><div class="sechead"><h2>Members</h2></div>${ins}<div class="mbars">${rows}</div></section>`;
+}
+function matrixSection(R){
+  if(!R.mrows)return'';let head='<tr><th>Category</th>';R.mids.forEach(u=>head+=`<th class="num">${esc(R.mnames[u])}</th>`);head+='<th class="num">Total</th></tr>';
+  let body='';R.mrows.forEach(r=>{let cells='';R.mids.forEach(u=>cells+=`<td class="num">${fmt(r.per[u]||0)}</td>`);body+=`<tr><td>${esc(r.category)}</td>${cells}<td class="num strong">${fmt(r.total)}</td></tr>`;});
+  return `<section class="card"><div class="sechead"><h2>Category × member</h2></div><div class="tablewrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div></section>`;
+}
+function settleSection(R){
+  if(!R.settle)return'';if(!R.settle.length)return`<section class="card"><div class="sechead"><h2>Settle up</h2></div><p class="muted">Everyone is settled up.</p></section>`;
+  let items='';R.settle.forEach(t=>items+=`<li><span class="from">${esc(R.mnames[t.from])}</span><span class="arrow">→</span><span class="to">${esc(R.mnames[t.to])}</span><span class="amt num">${fmt(t.amt)}</span></li>`);
+  return `<section class="card"><div class="sechead"><h2>Settle up</h2></div><p class="muted">Minimum ${R.settle.length} transactions to settle up</p><ul class="settle">${items}</ul></section>`;
+}
+function topSection(R){
+  if(!R.top.length)return'';let items='';R.top.forEach((t,i)=>items+=`<li><span class="rank num">${i+1}</span><span class="tt-desc">${esc(t.desc)}</span><span class="tt-cat">${esc(t.cat)}</span><span class="tt-amt num">${fmt(amountOf(t))}</span></li>`);
+  return `<section class="card"><div class="sechead"><h2>Top transactions</h2></div><ol class="toplist">${items}</ol></section>`;
+}
+function ledgerSection(R){
+  const MAXR=400,ord=R.ledger.slice().reverse(),shown=ord.slice(0,MAXR);
+  const note=ord.length>MAXR?`<p class="muted">Showing the ${MAXR} most recent of ${ord.length} — narrow the range for older.</p>`:'';
+  let rows='';shown.forEach(r=>{rows+=`<tr><td class="num">${esc(r.date)}</td><td>${esc(r.desc)}</td><td><span class="pill">${esc(r.cat)}</span></td><td class="num">${fmt(r.cost)}</td><td class="num">${fmt(owed(r,ME))}</td><td class="num">${fmt(paid(r,ME))}</td></tr>`;});
+  return `<section class="card"><div class="sechead"><h2>All transactions</h2></div>${note}<input class="search" placeholder="Search ${shown.length} transactions…" oninput="FT(this)"><div class="tablewrap scroll"><table id="ledger"><thead><tr><th data-k="date">Date</th><th data-k="desc">Description</th><th data-k="cat">Category</th><th data-k="cost" class="num">Cost</th><th data-k="share" class="num">Your share</th><th data-k="paid" class="num">You paid</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+}
+
+/* ---------- render + filter ---------- */
+function inRange(e,f,t){return (!f||e.date>=f)&&(!t||e.date<=t);}
+function render(){
+  const f=document.getElementById('from').value,t=document.getElementById('to').value;
+  const rows=ALL.filter(e=>inRange(e,f,t));
+  const sub=document.getElementById('subhead'),warns=document.getElementById('warns'),secs=document.getElementById('sections');
+  if(!rows.length){secs.innerHTML='<div class="card empty">No transactions in this range.</div>';sub.innerHTML='';warns.innerHTML='';return;}
+  const R=compute(rows);
+  // verify badge: only meaningful for the full range (matches Python reference)
+  let vbadge='';
+  if(!f&&!t){const ok=R.grand===META.verify_total_paise;
+    vbadge=ok?'<span class="ok">reconciled</span>':'<span class="bad">⚠ compute mismatch</span>';}
+  const dates=rows.map(e=>e.date).sort();
+  sub.innerHTML=`<span class="num">${rows.length} transactions</span><span>${esc(dates[0])} — ${esc(dates[dates.length-1])}</span>${vbadge}`;
+  let w='';if(META.mixed_currency)w+=`<div class="warn">Mixed currencies (${META.currencies.join(', ')}) — figures may span currencies.</div>`;
+  if(META.truncated)w+=`<div class="warn">Data truncated at ${META.pages_fetched} pages — not all transactions included.</div>`;
+  warns.innerHTML=w;
+  secs.innerHTML=[heroSection(R),catSection(R),monthlySection(R),memberSection(R),matrixSection(R),settleSection(R),topSection(R),ledgerSection(R)].join('');
+  bindLedger();
+}
+function bindLedger(){
+  document.querySelectorAll('#ledger th[data-k]').forEach(th=>th.addEventListener('click',()=>{
+    const tb=th.closest('table').querySelector('tbody'),idx=[].indexOf.call(th.parentNode.children,th),asc=th.dataset.asc!=='1';th.dataset.asc=asc?'1':'0';
+    const rs=[].slice.call(tb.querySelectorAll('tr'));rs.sort((a,b)=>{let x=a.children[idx].textContent.trim(),y=b.children[idx].textContent.trim();
+      let nx=parseFloat(x.replace(/[^0-9.-]/g,'')),ny=parseFloat(y.replace(/[^0-9.-]/g,''));
+      if(!isNaN(nx)&&!isNaN(ny))return asc?nx-ny:ny-nx;return asc?x.localeCompare(y):y.localeCompare(x);});
+    rs.forEach(r=>tb.appendChild(r));}));
+}
+function FT(i){const q=i.value.toLowerCase();document.querySelectorAll('#ledger tbody tr').forEach(r=>{r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}
+function TT(){const h=document.documentElement;h.dataset.theme=h.dataset.theme==='dark'?'light':'dark';}
+
+/* ---------- presets ---------- */
+const allDates=ALL.map(e=>e.date).sort();
+const MIND=allDates[0]||'',MAXD=allDates[allDates.length-1]||'';
+function shiftMonths(iso,n){const d=new Date(iso+'T00:00:00Z');d.setUTCMonth(d.getUTCMonth()+n);return d.toISOString().slice(0,10);}
+function setPreset(r){
+  let f='',t=MAXD;
+  if(r==='1m')f=shiftMonths(MAXD,-1); else if(r==='3m')f=shiftMonths(MAXD,-3);
+  else if(r==='6m')f=shiftMonths(MAXD,-6); else if(r==='ytd')f=MAXD.slice(0,4)+'-01-01';
+  else{f='';t='';}
+  document.getElementById('from').value=f;document.getElementById('to').value=t;
+  document.querySelectorAll('#presets .chip').forEach(c=>c.classList.toggle('active',c.dataset.r===r));
+  render();
+}
+function RESET(){setPreset('all');}
+document.querySelectorAll('#presets .chip').forEach(c=>c.addEventListener('click',()=>setPreset(c.dataset.r)));
+['from','to'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{
+  document.querySelectorAll('#presets .chip').forEach(c=>c.classList.remove('active'));render();}));
+render();
+</script>
+</body></html>"""

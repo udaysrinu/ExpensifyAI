@@ -947,7 +947,16 @@ def register_analytics_tools(mcp: FastMCP) -> None:
 
             if generate_dashboard:
                 try:
-                    path = dashboard_mod.write_dashboard(result)
+                    dataset = analytics_mod.build_dataset(
+                        fetched["expenses"],
+                        current_user_id=current_user_id,
+                        target_type=target_type,
+                        target_id=target_id,
+                        target_label=label,
+                        truncated=fetched["truncated"],
+                        pages_fetched=fetched["pages_fetched"],
+                    )
+                    path = dashboard_mod.write_dashboard(dataset)
                     result["dashboard_path"] = path
                 except Exception as e:
                     logger.error(f"Dashboard write failed: {e}")

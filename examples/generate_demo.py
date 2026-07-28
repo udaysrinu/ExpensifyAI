@@ -84,16 +84,23 @@ DATA = [
 
 
 def main():
+    # Deterministic server-side compute (source of truth) — used to sanity-check.
     result = A.compute_analytics(
         DATA, current_user_id=YOU, target_type="group", target_id=101,
         target_label="Flat 4B · Demo",
     )
+    # Interactive dashboard renders from the embedded dataset (client re-filters live).
+    dataset = A.build_dataset(
+        DATA, current_user_id=YOU, target_type="group", target_id=101,
+        target_label="Flat 4B · Demo",
+    )
     out = Path(__file__).resolve().parent / "demo-dashboard.html"
-    out.write_text(D.render(result), encoding="utf-8")
+    out.write_text(D.render_interactive(dataset), encoding="utf-8")
     print(f"Wrote {out}")
     print(f"  reconciled: {result['reconciliation']['reconciled']}")
     print(f"  group total: {result['category_breakdown']['total']} INR")
     print(f"  settlement txns: {result['settlement']['transaction_count']}")
+    print(f"  verify_total_paise: {dataset['meta']['verify_total_paise']}")
 
 
 if __name__ == "__main__":

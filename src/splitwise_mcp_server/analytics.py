@@ -114,6 +114,79 @@ def normalize(raw_expenses: List[Dict[str, Any]]) -> List[NormalizedExpense]:
 
 
 # ----------------------------------------------------------------------------
+# Browser dataset (for interactive, client-side re-filtering)
+# ----------------------------------------------------------------------------
+
+def _paise(d: Decimal) -> int:
+    """Exact integer paise (₹1 = 100). Client math stays integer -> no float drift."""
+    return int(_q(d) * 100)
+
+
+def build_dataset(
+    raw_expenses: List[Dict[str, Any]],
+    current_user_id: int,
+    target_type: str,
+    target_id: Optional[int] = None,
+    target_label: str = "",
+    truncated: bool = False,
+    pages_fetched: int = 0,
+) -> Dict[str, Any]:
+    """Emit a compact, JSON-serializable dataset the browser can re-filter and
+    recompute against — every amount as integer paise. The client JS engine mirrors
+    compute_analytics exactly; `verify_total_paise` lets the page cross-check the JS
+    full-range total against this Python-computed value (the drift guard).
+    """
+    expenses = normalize(raw_expenses)
+    currencies = sorted({e.currency for e in expenses})
+    cur_counts: Dict[str, int] = defaultdict(int)
+    for e in expenses:
+        cur_counts[e.currency] += 1
+    primary = (sorted(cur_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+               if cur_counts else "")
+
+    names: Dict[int, str] = {}
+    rows = []
+    for e in expenses:
+        shares = {}
+        for uid, (name, paid, owed, _net) in e.shares.items():
+            names[uid] = name
+            shares[str(uid)] = [_paise(paid), _paise(owed)]
+        rows.append({
+            "id": e.id,
+            "date": e.day,
+            "month": e.month,
+            "desc": e.description,
+            "cat": e.category,
+            "cur": e.currency,
+            "cost": _paise(e.cost),
+            "shares": shares,
+        })
+
+    # Python-computed full-range total (group perspective = full cost) as drift guard.
+    if target_type == "group":
+        verify = sum(_paise(e.cost) for e in expenses)
+    else:
+        verify = sum(_paise(e.owed_of(current_user_id)) for e in expenses)
+
+    return {
+        "meta": {
+            "target_type": target_type,
+            "target_id": target_id,
+            "target_label": target_label,
+            "current_user_id": current_user_id,
+            "primary_currency": primary,
+            "currencies": currencies,
+            "mixed_currency": len(currencies) > 1,
+            "truncated": truncated,
+            "pages_fetched": pages_fetched,
+            "verify_total_paise": verify,
+        },
+        "names": {str(k): v for k, v in names.items()},
+        "expenses": rows,
+    }
+
+
+# ----------------------------------------------------------------------------
 # Main entry point
 # ----------------------------------------------------------------------------
 

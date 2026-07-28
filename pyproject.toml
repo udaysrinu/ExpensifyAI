@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "splitwise-mcp-server"
-version = "0.1.0"
-description = "Model Context Protocol server for Splitwise API integration with natural language entity resolution"
+name = "expensifyai"
+version = "0.2.0"
+description = "ExpensifyAI — MCP server for Splitwise with a deterministic analytics engine and an interactive, CRED-grade spending dashboard."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 license = "MIT"
@@ -56,10 +56,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/splitwise-mcp-server"
-Documentation = "https://github.com/yourusername/splitwise-mcp-server#readme"
-Repository = "https://github.com/yourusername/splitwise-mcp-server"
-Issues = "https://github.com/yourusername/splitwise-mcp-server/issues"
+Homepage = "https://github.com/udaysrinu/ExpensifyAI"
+Documentation = "https://github.com/udaysrinu/ExpensifyAI#readme"
+Repository = "https://github.com/udaysrinu/ExpensifyAI"
+Issues = "https://github.com/udaysrinu/ExpensifyAI/issues"
 
 [project.scripts]
 splitwise-mcp-server = "splitwise_mcp_server.__main__:main"

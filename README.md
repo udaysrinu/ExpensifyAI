@@ -10,8 +10,10 @@ minimum-transaction settlement plans — rendered as a self-contained, offline H
 > Built on top of the excellent [tarunn2799/splitwise-mcp](https://github.com/tarunn2799/splitwise-mcp);
 > extended with a deterministic analytics engine and a category-first dashboard.
 
-![ExpensifyAI dashboard](examples/demo-dashboard.html)
-*(open `examples/demo-dashboard.html` in a browser — generated from synthetic data, no account needed)*
+![ExpensifyAI dashboard](docs/screenshots/dashboard.png)
+
+*Interactive dashboard, generated from synthetic data. Open `examples/demo-dashboard.html`
+in a browser to try it live — pick a date range and every section recomputes instantly.*
 
 ## Analytics (what makes this ExpensifyAI)
 
@@ -23,10 +25,17 @@ minimum-transaction settlement plans — rendered as a self-contained, offline H
 - **Seven analytics modules** — category breakdown · monthly trend · owed-vs-paid ("mine vs split")
   · per-member comparison + category×member matrix · transaction ledger · top transactions ·
   **settlement optimizer** (minimum transactions to settle a group — no other Splitwise tool has this).
-- **Premium offline dashboard** — CRED-grade dark UI, hand-rolled inline-SVG charts, validated
-  colorblind-safe palette, works with no network and no JS.
+- **Interactive dashboard** — CRED-grade dark UI with a live date-range picker + presets
+  (this month / 3mo / 6mo / this year / all) that re-filter and recompute every section in the
+  browser. Hand-rolled inline-SVG charts, validated colorblind-safe palette, fully offline
+  (self-contained single file — no CDN, no server). All client math is integer paise, so the
+  live recompute stays exact and reconciles against the Python source of truth.
 - **Two tools** — `analyze_spending(target_type, target_id?, dates?, generate_dashboard?)` and
   `compare_group_members(group_id, …)`. `target_type` is `me` | `group` | `friend`.
+
+Pick any date range — the whole dashboard recomputes live in the browser:
+
+![Filtered to one month](docs/screenshots/filtered.png)
 
 Try it without an account:
 
@@ -44,12 +53,10 @@ python examples/generate_demo.py   # writes examples/demo-dashboard.html
 ## Installation
 
 ```bash
-# From PyPI (when published)
-pip install splitwise-mcp-server
-
-# From Source
-git clone https://github.com/tarunn2799/splitwise-mcp-server
-cd splitwise-mcp-server
+git clone https://github.com/udaysrinu/ExpensifyAI
+cd ExpensifyAI
+python -m venv venv
+source venv/bin/activate
 pip install -e .
 ```
 
@@ -153,16 +160,23 @@ See [TOOLS.md](TOOLS.md) for detailed documentation.
 
 ```bash
 # Setup
-git clone https://github.com/tarunn2799/splitwise-mcp-server
-cd splitwise-mcp-server
+git clone https://github.com/udaysrinu/ExpensifyAI
+cd ExpensifyAI
 python -m venv venv
 source venv/bin/activate
 pip install -e ".[dev]"
 
 # Test
-pytest
+pytest                              # full suite
+pytest tests/test_analytics.py      # deterministic analytics (15 tests)
+
+# See the dashboard with no account
+python examples/generate_demo.py    # writes examples/demo-dashboard.html
 ```
 
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+Built on top of [tarunn2799/splitwise-mcp](https://github.com/tarunn2799/splitwise-mcp) (MIT);
+the analytics engine, interactive dashboard, and tests are added by ExpensifyAI.

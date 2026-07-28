@@ -12,6 +12,8 @@ from .client import SplitwiseClient
 from .resolver import EntityResolver
 from . import analytics as analytics_mod
 from . import dashboard as dashboard_mod
+from . import itemize as itemize_mod
+from . import splits_store
 from .errors import (
     ValidationError,
     RateLimitError,
@@ -120,6 +122,7 @@ def create_server() -> FastMCP:
     register_notification_tools(mcp)
     register_utility_tools(mcp)
     register_analytics_tools(mcp)
+    register_itemization_tools(mcp)
 
     logger.info("All tools registered successfully")
     
@@ -989,3 +992,143 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             dated_before=dated_before,
             generate_dashboard=generate_dashboard,
         )
+
+
+# ============================================================================
+# Itemization Tools (structured line-items, per-item splits, default templates)
+# ============================================================================
+
+def register_itemization_tools(mcp: FastMCP) -> None:
+    """Register itemized-expense + default-split tools.
+
+    Receipt scanning is LLM-vision-native: the calling agent reads the receipt image,
+    extracts line-items, then calls create_itemized_expense. This module owns the exact
+    (integer-paise) split math and the Splitwise write — not OCR.
+    """
+
+    @mcp.tool()
+    async def create_itemized_expense(
+        description: str,
+        group_id: int,
+        items: List[Dict[str, Any]],
+        currency_code: str = "INR",
+        date: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Create ONE Splitwise expense from itemized line-items, each with its OWN split.
+
+        This is how a receipt becomes an expense: the agent extracts line-items from the
+        receipt image and passes them here. Each item can split differently (e.g. beers
+        3/4 to one person, groceries 4-way, cake between two) — the tool computes each
+        person's total owed_share exactly in integer paise and reconciles to the total
+        before writing. Set dry_run=True to preview the computed split without creating.
+
+        items: list of
+          {
+            "desc": "Beers",
+            "amount": "2710.00",           # rupees, string with 2 decimals
+            "category": "Drinks",          # optional (free text, informational)
+            "paid_by": <user_id>,          # who fronted this item
+            "split": {                     # OR "split_ref": "<saved template name>"
+               "type": "equal" | "shares" | "exact",
+               "among": [user_id, ...],           # for equal/shares
+               "shares": {user_id: weight, ...},  # for shares
+               "exact":  {user_id: "amount", ...} # for exact (must sum to amount)
+            }
+          }
+        """
+        try:
+            validate_required(description, "description")
+            if date:
+                validate_date_format(date, "date")
+            if not items:
+                raise ValidationError("items is required and must be non-empty", field="items")
+
+            templates = splits_store.load_all()
+            try:
+                agg = itemize_mod.aggregate_items(items, default_splits=templates)
+            except itemize_mod.ItemizeError as e:
+                raise ValidationError(str(e), field="items")
+
+            if not agg["reconciled"]:
+                return {
+                    "created": False,
+                    "reconciled": False,
+                    "discrepancy": agg["discrepancy"],
+                    "message": ("Per-item shares do not sum to the item totals; refusing to "
+                                "create a wrong expense. Check the line-items."),
+                    "computed": {"cost": agg["cost"], "users": agg["users"]},
+                }
+
+            preview = {
+                "created": False,
+                "reconciled": True,
+                "cost": agg["cost"],
+                "currency_code": currency_code,
+                "users": agg["users"],
+                "per_user": {str(k): v for k, v in agg["per_user"].items()},
+                "details": agg["details"],
+            }
+            if dry_run:
+                preview["dry_run"] = True
+                return preview
+
+            expense_data = {
+                "cost": agg["cost"],
+                "description": description,
+                "currency_code": currency_code,
+                "group_id": group_id,
+                "split_equally": False,
+                "users": agg["users"],
+                "details": agg["details"] + "\n\n— Automated note by ExpensifyAI. "
+                                            "If you have any doubts, reach out to Uday.",
+            }
+            expense_data["date"] = date or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            result = await client.create_expense(expense_data)
+            errors = result.get("errors")
+            has_err = bool(errors) and (errors if isinstance(errors, list) else errors.get("base"))
+            created = result.get("expenses", [])
+            logger.info(f"Itemized expense '{description}': {len(items)} items, cost {agg['cost']}")
+            return {
+                "created": not has_err and bool(created),
+                "reconciled": True,
+                "expense": created[0] if created else None,
+                "errors": errors,
+                "computed": {"cost": agg["cost"], "users": agg["users"]},
+            }
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error creating itemized expense: {e}")
+            raise
+
+    @mcp.tool()
+    async def save_default_split(name: str, split: Dict[str, Any]) -> Dict[str, Any]:
+        """Save a reusable split template by name (e.g. "roomies-4way").
+
+        split: {"type": "equal"|"shares", "among": [user_id, ...], "shares"?: {user_id: weight}}
+        Referenced from create_itemized_expense items via "split_ref": "<name>".
+        Stored locally in ~/.expensifyai/splits.json.
+        """
+        try:
+            validate_required(name, "name")
+            if not isinstance(split, dict) or "type" not in split:
+                raise ValidationError("split must be an object with a 'type'", field="split")
+            splits_store.save(name, split)
+            return {"saved": True, "name": name, "split": split}
+        except ValidationError:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving default split: {e}")
+            raise
+
+    @mcp.tool()
+    async def list_default_splits() -> Dict[str, Any]:
+        """List all saved split templates."""
+        return {"splits": splits_store.load_all()}
+
+    @mcp.tool()
+    async def delete_default_split(name: str) -> Dict[str, Any]:
+        """Delete a saved split template by name."""
+        return {"deleted": splits_store.delete(name), "name": name}

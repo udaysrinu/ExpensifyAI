@@ -30,8 +30,25 @@ in a browser to try it live — pick a date range and every section recomputes i
   browser. Hand-rolled inline-SVG charts, validated colorblind-safe palette, fully offline
   (self-contained single file — no CDN, no server). All client math is integer paise, so the
   live recompute stays exact and reconciles against the Python source of truth.
-- **Two tools** — `analyze_spending(target_type, target_id?, dates?, generate_dashboard?)` and
-  `compare_group_members(group_id, …)`. `target_type` is `me` | `group` | `friend`.
+- **Two analytics tools** — `analyze_spending(target_type, target_id?, dates?, generate_dashboard?)`
+  and `compare_group_members(group_id, …)`. `target_type` is `me` | `group` | `friend`.
+
+## Itemization, receipt scanning & default splits
+
+Splitwise-Pro-parity, built deterministically:
+
+- **Structured itemization** — `create_itemized_expense(description, group_id, items, …)` turns
+  line-items into ONE expense where **each item can split differently** (beers ¾ to one person,
+  groceries 4-way, cake between two). Each person's total `owed_share` is computed in exact
+  integer paise (largest-remainder rounding, so an indivisible ₹100/3 still sums back to ₹100),
+  and the expense is **reconciled to its total before anything is written** — a mismatch refuses
+  to create rather than posting a wrong split. `dry_run=True` previews the computed split.
+- **Receipt scanning (LLM-vision-native)** — no OCR engine, no cloud keys, no new dependencies:
+  the calling agent (Claude) reads the receipt image, extracts line-items, and calls
+  `create_itemized_expense`. The server owns the exact math and the Splitwise write.
+- **Save default splits** — `save_default_split(name, split)` / `list_default_splits` /
+  `delete_default_split`. Reuse a template by putting `"split_ref": "roomies-4way"` on an item.
+  Stored locally in `~/.expensifyai/splits.json`.
 
 Pick any date range — the whole dashboard recomputes live in the browser:
 

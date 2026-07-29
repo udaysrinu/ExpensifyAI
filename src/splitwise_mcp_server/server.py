@@ -1132,3 +1132,51 @@ def register_itemization_tools(mcp: FastMCP) -> None:
     async def delete_default_split(name: str) -> Dict[str, Any]:
         """Delete a saved split template by name."""
         return {"deleted": splits_store.delete(name), "name": name}
+
+    @mcp.tool()
+    async def attach_receipt(expense_id: int, image_path: str) -> Dict[str, Any]:
+        """Attach a receipt image or PDF (from a local file path) to an existing expense.
+
+        Uploads the file to Splitwise via multipart on update_expense. Supports common
+        image types and PDF. The receipt then shows on the expense in the app/website.
+        (Splitwise's API only exposes receipt UPLOAD, not OCR — pair this with
+        create_itemized_expense, where the calling agent reads the image for line-items.)
+        """
+        import os
+        import mimetypes
+
+        try:
+            if not os.path.isfile(image_path):
+                raise ValidationError(f"file not found: {image_path}", field="image_path")
+            size = os.path.getsize(image_path)
+            if size == 0:
+                raise ValidationError("file is empty", field="image_path")
+            if size > 25 * 1024 * 1024:
+                raise ValidationError("file exceeds 25 MB", field="image_path")
+
+            ctype = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
+            filename = os.path.basename(image_path)
+            with open(image_path, "rb") as fh:
+                content = fh.read()
+
+            result = await client.post_multipart(
+                f"/update_expense/{expense_id}",
+                files={"receipt": (filename, content, ctype)},
+            )
+            errors = result.get("errors")
+            has_err = bool(errors) and (errors if isinstance(errors, list) else errors.get("base"))
+            expenses = result.get("expenses", [])
+            receipt = expenses[0].get("receipt") if expenses else None
+            logger.info(f"Attached receipt '{filename}' ({size} bytes) to expense {expense_id}")
+            return {
+                "attached": not has_err and bool(expenses),
+                "expense_id": expense_id,
+                "filename": filename,
+                "receipt": receipt,
+                "errors": errors,
+            }
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error attaching receipt: {e}")
+            raise

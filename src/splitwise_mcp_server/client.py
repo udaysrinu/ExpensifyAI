@@ -341,6 +341,35 @@ class SplitwiseClient:
 
         raise last_exception or Exception("Request failed after retries")
 
+    async def post_multipart(
+        self,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """POST as multipart/form-data — used for receipt file uploads.
+
+        Unlike `post` (JSON), this sends form fields + file parts. httpx sets the
+        multipart Content-Type boundary automatically from `files`, so we only add
+        the auth header. Same error handling as `post`; not retried (file bodies
+        should not be blindly re-sent).
+        """
+        url = f"{self.BASE_URL}{endpoint}"
+        headers = self._get_headers()
+        headers.pop("Content-Type", None)  # let httpx set the multipart boundary
+        self._log_request("POST(multipart)", url)
+
+        response = await self.client.post(url, headers=headers, data=data or {}, files=files or {})
+        self._log_response(response)
+
+        if response.status_code >= 400:
+            error = self.handle_api_error(response)
+            raise Exception(f"{error.message} (Status: {error.status_code})")
+
+        result = response.json()
+        self._validate_write_response(result)
+        return result
+
     # User endpoints
     
     async def get_current_user(self) -> Dict[str, Any]:

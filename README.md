@@ -46,6 +46,9 @@ Splitwise-Pro-parity, built deterministically:
 - **Receipt scanning (LLM-vision-native)** — no OCR engine, no cloud keys, no new dependencies:
   the calling agent (Claude) reads the receipt image, extracts line-items, and calls
   `create_itemized_expense`. The server owns the exact math and the Splitwise write.
+- **Receipt image upload** — `attach_receipt(expense_id, image_path)` uploads a local
+  image/PDF to an existing expense (multipart), so the receipt shows on it in the Splitwise
+  app. Pairs with the scan flow: extract line-items from the image, then attach the image itself.
 - **Save default splits** — `save_default_split(name, split)` / `list_default_splits` /
   `delete_default_split`. Reuse a template by putting `"split_ref": "roomies-4way"` on an item.
   Stored locally in `~/.expensifyai/splits.json`.

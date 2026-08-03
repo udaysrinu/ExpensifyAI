@@ -1080,7 +1080,8 @@ def register_itemization_tools(mcp: FastMCP) -> None:
                 "group_id": group_id,
                 "split_equally": False,
                 "users": agg["users"],
-                "details": agg["details"] + "\n\n— Automated note by ExpensifyAI. "
+                "details": agg["details"] + "\n\n— Automated note by ExpensifyAI "
+                                            "(github.com/udaysrinu/ExpensifyAI). "
                                             "If you have any doubts, reach out to Uday.",
             }
             expense_data["date"] = date or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

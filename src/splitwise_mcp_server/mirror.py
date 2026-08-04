@@ -195,3 +195,49 @@ def stats(conn: sqlite3.Connection) -> Dict[str, Any]:
         "friends": conn.execute("SELECT COUNT(*) c FROM friends").fetchone()["c"],
         "last_synced_at": get_cursor(conn),
     }
+
+
+def fuzzy_search(conn: sqlite3.Connection, query: str, min_score: int = 70,
+                 include_deleted: bool = False, limit: int = 25) -> List[Dict[str, Any]]:
+    """Fuzzy full-text over description + details (notes), for when exact FTS misses.
+
+    Catches typos, abbreviations (vizag≈vskp≈vtz), and — crucially — amounts/words buried
+    inside a bundle's note (e.g. a '5552' line inside a multi-item details field). Uses
+    rapidfuzz partial-ratio (already a repo dependency). An exact case-insensitive substring
+    match always scores 100 so number-in-note lookups are reliable.
+
+    Returns matches sorted by score desc, each = {score, matched_in, expense: <raw>}.
+    """
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        # graceful fallback: substring only
+        fuzz = None
+
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    sql = "SELECT raw, description, details FROM expenses"
+    if not include_deleted:
+        sql += " WHERE deleted = 0"
+    scored = []
+    for row in conn.execute(sql):
+        desc = (row["description"] or "")
+        det = (row["details"] or "")
+        hay_desc, hay_det = desc.lower(), det.lower()
+        # exact substring anywhere -> top score, note where it hit
+        if q in hay_desc:
+            score, where = 100, "description"
+        elif q in hay_det:
+            score, where = 100, "note"
+        elif fuzz is not None:
+            sd = fuzz.partial_ratio(q, hay_desc)
+            st = fuzz.partial_ratio(q, hay_det) if hay_det else 0
+            score = max(sd, st)
+            where = "description" if sd >= st else "note"
+        else:
+            continue
+        if score >= min_score:
+            scored.append((score, where, json.loads(row["raw"])))
+    scored.sort(key=lambda x: (-x[0], x[2].get("date", "")))
+    return [{"score": s, "matched_in": w, "expense": e} for s, w, e in scored[:limit]]

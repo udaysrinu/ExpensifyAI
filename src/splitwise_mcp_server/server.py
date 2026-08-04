@@ -1246,6 +1246,29 @@ def register_sync_tools(mcp: FastMCP) -> None:
             raise
 
     @mcp.tool()
+    async def search_notes(query: str, min_score: int = 70, include_deleted: bool = False,
+                           limit: int = 25) -> Dict[str, Any]:
+        """Fuzzy search over expense descriptions AND notes/details in the local mirror.
+
+        Use when exact search misses — catches typos, abbreviations (vizag/vskp/vtz), and
+        amounts or words buried inside a bundled expense's note (e.g. a '5552' line inside a
+        multi-item details field). Returns matches with a score (100 = exact substring) and
+        whether it hit the description or the note. Run sync_all first.
+        """
+        try:
+            conn = mirror_mod.connect()
+            results = mirror_mod.fuzzy_search(conn, query, min_score=min_score,
+                                              include_deleted=include_deleted, limit=limit)
+            stats = mirror_mod.stats(conn)
+            conn.close()
+            if not stats["last_synced_at"]:
+                return {"warning": "Mirror empty — run sync_all first.", "results": [], "count": 0}
+            return {"count": len(results), "results": results, "last_synced_at": stats["last_synced_at"]}
+        except Exception as e:
+            logger.error(f"Error in fuzzy note search: {e}")
+            raise
+
+    @mcp.tool()
     async def search_expenses(
         query: Optional[str] = None,
         min_amount: Optional[float] = None,

@@ -14,6 +14,7 @@ from . import analytics as analytics_mod
 from . import dashboard as dashboard_mod
 from . import itemize as itemize_mod
 from . import splits_store
+from . import mirror as mirror_mod
 from .errors import (
     ValidationError,
     RateLimitError,
@@ -123,6 +124,7 @@ def create_server() -> FastMCP:
     register_utility_tools(mcp)
     register_analytics_tools(mcp)
     register_itemization_tools(mcp)
+    register_sync_tools(mcp)
 
     logger.info("All tools registered successfully")
     
@@ -1180,4 +1182,97 @@ def register_itemization_tools(mcp: FastMCP) -> None:
             raise
         except Exception as e:
             logger.error(f"Error attaching receipt: {e}")
+            raise
+
+# ============================================================================
+# Sync + Search Tools (local SQLite mirror, delta sync)
+# ============================================================================
+
+def register_sync_tools(mcp: FastMCP) -> None:
+    """Register the local-mirror delta sync + search tools."""
+
+    @mcp.tool()
+    async def sync_all(full: bool = False) -> Dict[str, Any]:
+        """Sync Splitwise into a local SQLite mirror for instant offline search.
+
+        Delta sync: uses the API's `updated_after` cursor so only expenses that were
+        added, edited, moved, or deleted since the last sync are fetched (first run, or
+        full=True, pulls everything). Groups and friends are fully refreshed each run
+        (small). Upserts by expense id, so re-running is safe. Returns counts.
+        """
+        try:
+            conn = mirror_mod.connect()
+            cursor = None if full else mirror_mod.get_cursor(conn)
+            sync_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # refresh groups + friends (small, full each time)
+            try:
+                for g in (await client.get_groups()).get("groups", []):
+                    mirror_mod.upsert_group(conn, g)
+                for fr in (await client.get_friends()).get("friends", []):
+                    mirror_mod.upsert_friend(conn, fr)
+            except Exception as e:
+                logger.warning(f"group/friend refresh failed: {e}")
+
+            # delta (or full) expense pull, paginated sequentially
+            counts = {"new": 0, "updated": 0, "deleted": 0, "skipped": 0}
+            page_size, offset, pages = 100, 0, 0
+            while pages < 200:
+                pages += 1
+                resp = await client.get_expenses(
+                    updated_after=cursor, limit=page_size, offset=offset)
+                batch = resp.get("expenses", []) if isinstance(resp, dict) else []
+                for raw in batch:
+                    outcome = mirror_mod.upsert_expense(conn, raw)   # upsert ONCE per expense
+                    counts[outcome] = counts.get(outcome, 0) + 1
+                if len(batch) < page_size:
+                    break
+                offset += page_size
+
+            # advance cursor only after a clean pass
+            mirror_mod.set_cursor(conn, sync_start)
+            s = mirror_mod.stats(conn)
+            conn.close()
+            logger.info(f"Sync complete ({'full' if full else 'delta'}): {s}")
+            return {"mode": "full" if full else "delta", "pages_fetched": pages,
+                    "changes": counts, "cursor_before": cursor, "cursor_after": sync_start,
+                    "db_stats": s}
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error during sync: {e}")
+            raise
+
+    @mcp.tool()
+    async def search_expenses(
+        query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        max_amount: Optional[float] = None,
+        user_id: Optional[int] = None,
+        group_id: Optional[int] = None,
+        category: Optional[str] = None,
+        dated_after: Optional[str] = None,
+        dated_before: Optional[str] = None,
+        include_deleted: bool = False,
+        include_payments: bool = True,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Search the local mirror (run sync_all first). Full-text over description/details/
+        category, plus filters: amount range, user_id, group_id, category, date range.
+        Returns matching expenses. Instant, offline, no API calls, no Pro paywall.
+        """
+        try:
+            conn = mirror_mod.connect()
+            results = mirror_mod.search(
+                conn, query=query, min_amount=min_amount, max_amount=max_amount,
+                user_id=user_id, group_id=group_id, category=category,
+                dated_after=dated_after, dated_before=dated_before,
+                include_deleted=include_deleted, include_payments=include_payments, limit=limit)
+            stats = mirror_mod.stats(conn)
+            conn.close()
+            if not stats["last_synced_at"]:
+                return {"warning": "Mirror is empty — run sync_all first.", "results": [], "count": 0}
+            return {"count": len(results), "results": results, "last_synced_at": stats["last_synced_at"]}
+        except Exception as e:
+            logger.error(f"Error searching expenses: {e}")
             raise

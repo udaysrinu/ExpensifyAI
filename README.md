@@ -33,6 +33,23 @@ in a browser to try it live — pick a date range and every section recomputes i
 - **Two analytics tools** — `analyze_spending(target_type, target_id?, dates?, generate_dashboard?)`
   and `compare_group_members(group_id, …)`. `target_type` is `me` | `group` | `friend`.
 
+## Local mirror: delta sync + instant search
+
+Splitwise's own search is Pro-paywalled and the API has no search endpoint. ExpensifyAI
+mirrors your data into a local SQLite DB (`~/.expensifyai/splitwise.db`) and searches it offline.
+
+- **`sync_all(full=False)`** — **delta sync**: uses the API's `updated_after` cursor so only
+  expenses added/edited/moved/deleted since the last sync are fetched (first run pulls everything;
+  a re-sync with no changes is a single call). Upserts by expense id, so it's idempotent. Groups
+  and friends are fully refreshed each run (small). Deletes are mirrored (soft-deleted, excluded
+  from search by default).
+- **`search_expenses(query?, min_amount?, max_amount?, user_id?, group_id?, category?, dates?)`** —
+  full-text (FTS5) over description/details/category plus structured filters, against the local DB.
+  Instant, offline, covers your entire history across all groups. Beats the paywalled app search.
+
+Each expense's full raw API object is stored (`raw` column) as the source of truth, so displayed
+values stay faithful — the indexed REAL columns are only for filtering.
+
 ## Itemization, receipt scanning & default splits
 
 Splitwise-Pro-parity, built deterministically:

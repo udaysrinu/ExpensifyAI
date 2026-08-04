@@ -15,6 +15,7 @@ from . import dashboard as dashboard_mod
 from . import itemize as itemize_mod
 from . import splits_store
 from . import mirror as mirror_mod
+from . import statement_import as statement_import_mod
 from .errors import (
     ValidationError,
     RateLimitError,
@@ -125,6 +126,7 @@ def create_server() -> FastMCP:
     register_analytics_tools(mcp)
     register_itemization_tools(mcp)
     register_sync_tools(mcp)
+    register_statement_tools(mcp)
 
     logger.info("All tools registered successfully")
     
@@ -1275,4 +1277,125 @@ def register_sync_tools(mcp: FastMCP) -> None:
             return {"count": len(results), "results": results, "last_synced_at": stats["last_synced_at"]}
         except Exception as e:
             logger.error(f"Error searching expenses: {e}")
+            raise
+
+
+# ============================================================================
+# Statement Import Tools (bulk import from a parsed statement)
+# ============================================================================
+
+def register_statement_tools(mcp: FastMCP) -> None:
+    """Register statement-import tools.
+
+    The calling agent reads the raw statement (PDF/CSV/email/screenshot) and passes
+    clean rows to import_statement, which returns a reviewable proposal (category +
+    split + duplicate flags). After the user approves, confirm_import bulk-creates the
+    included rows via the itemization engine. Two-step so nothing is created without review.
+    """
+
+    @mcp.tool()
+    async def import_statement(
+        transactions: List[Dict[str, Any]],
+        default_split_name: Optional[str] = None,
+        dedup: bool = True,
+    ) -> Dict[str, Any]:
+        """Turn parsed statement rows into a reviewable import proposal (creates NOTHING).
+
+        transactions: list of {date: 'YYYY-MM-DD', merchant (or description), amount,
+                      category? (override), split_ref? (a saved default-split name)}.
+        default_split_name: template applied to rows without their own split_ref; if omitted,
+                            rows default to 100%-personal (you pay + owe fully).
+        dedup: if True, flags rows that match an existing expense in the local mirror
+               (same day + same amount) and marks them to skip, so re-importing a statement
+               doesn't double-add. (Run sync_all first for dedup to see your existing data.)
+
+        Returns proposals + summary. Review, then call confirm_import with the rows to create.
+        """
+        try:
+            if not transactions:
+                raise ValidationError("transactions is required", field="transactions")
+            me = (await client.get_current_user())["user"]["id"]
+            templates = splits_store.load_all()
+            existing = []
+            if dedup:
+                try:
+                    conn = mirror_mod.connect()
+                    existing = mirror_mod.search(conn, include_payments=False, limit=10000)
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"dedup skipped (mirror unavailable): {e}")
+            proposal = statement_import_mod.build_proposal(
+                transactions, current_user_id=me,
+                default_split_name=default_split_name, default_splits=templates,
+                existing=existing)
+            proposal["note"] = ("Review the proposals. Duplicates are excluded by default. "
+                                "Call confirm_import with the rows you want to create.")
+            return proposal
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error importing statement: {e}")
+            raise
+
+    @mcp.tool()
+    async def confirm_import(
+        rows: List[Dict[str, Any]],
+        group_id: int = 0,
+        currency_code: str = "INR",
+    ) -> Dict[str, Any]:
+        """Bulk-create expenses from approved statement rows (after import_statement review).
+
+        rows: approved items, each {date, description, amount, category?, split_ref?}.
+              Rows with a split_ref use that saved template; otherwise 100%-personal.
+        group_id: default group for created expenses (0 = non-group). Per-row group_id overrides.
+        Each expense is created via the itemization engine (exact paise, reconciled). Returns
+        a per-row result list (created id or error). Sequential to stay under rate limits.
+        """
+        try:
+            if not rows:
+                raise ValidationError("rows is required", field="rows")
+            me = (await client.get_current_user())["user"]["id"]
+            templates = splits_store.load_all()
+            results = []
+            for r in rows:
+                desc = r.get("description") or r.get("merchant") or "Imported expense"
+                amount = str(r.get("amount"))
+                split_ref = r.get("split_ref")
+                gid = r.get("group_id", group_id)
+                # build a single-item itemized expense (personal if no split_ref)
+                if split_ref and split_ref in templates:
+                    item = {"desc": desc, "amount": amount, "paid_by": me, "split_ref": split_ref}
+                else:
+                    item = {"desc": desc, "amount": amount, "paid_by": me,
+                            "split": {"type": "exact", "exact": {me: amount}}}  # 100% you
+                try:
+                    agg = itemize_mod.aggregate_items([item], default_splits=templates)
+                    if not agg["reconciled"]:
+                        results.append({"description": desc, "created": False,
+                                        "error": "reconciliation failed", "discrepancy": agg["discrepancy"]})
+                        continue
+                    expense_data = {
+                        "cost": agg["cost"], "description": desc, "currency_code": currency_code,
+                        "group_id": gid, "split_equally": False, "users": agg["users"],
+                        "date": (r.get("date") or "") + "T12:00:00Z" if r.get("date") else
+                                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "details": f"Imported from statement.\n\n— Automated entry by ExpensifyAI "
+                                   f"(github.com/udaysrinu/ExpensifyAI). For any discrepancies or "
+                                   f"clarifications, please reach out to Uday.",
+                    }
+                    resp = await client.create_expense(expense_data)
+                    created = resp.get("expenses", [])
+                    results.append({"description": desc, "amount": agg["cost"],
+                                    "created": bool(created),
+                                    "expense_id": created[0]["id"] if created else None,
+                                    "errors": resp.get("errors")})
+                except Exception as e:
+                    results.append({"description": desc, "created": False, "error": str(e)})
+            created_n = sum(1 for r in results if r.get("created"))
+            logger.info(f"Statement import: created {created_n}/{len(rows)}")
+            return {"created": created_n, "total": len(rows), "results": results}
+        except (ValidationError, RateLimitError):
+            raise
+        except Exception as e:
+            logger.error(f"Error confirming import: {e}")
             raise

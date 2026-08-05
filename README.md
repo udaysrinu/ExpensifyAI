@@ -66,6 +66,14 @@ Splitwise-Pro-parity, built deterministically:
 - **Receipt image upload** — `attach_receipt(expense_id, image_path)` uploads a local
   image/PDF to an existing expense (multipart), so the receipt shows on it in the Splitwise
   app. Pairs with the scan flow: extract line-items from the image, then attach the image itself.
+- **Statement import** — `import_statement(transactions, default_split_name?, dedup)` proposes a
+  categorized, split-suggested, duplicate-flagged list from parsed statement rows;
+  `confirm_import(rows)` bulk-creates the approved ones via the itemization engine.
+- **Gmail read-only connector (optional)** — `gmail_find_statements` / `gmail_read_statement`
+  fetch bank/card statement emails (scope `gmail.readonly`) to feed statement import — the
+  CRED-style "no manual entry" flow. Requires a one-time Google Cloud OAuth setup; install
+  extras with `pip install -e ".[gmail]"`. The connector only reads email text; all expense
+  creation still goes through the reviewed import path.
 - **Save default splits** — `save_default_split(name, split)` / `list_default_splits` /
   `delete_default_split`. Reuse a template by putting `"split_ref": "roomies-4way"` on an item.
   Stored locally in `~/.expensifyai/splits.json`.

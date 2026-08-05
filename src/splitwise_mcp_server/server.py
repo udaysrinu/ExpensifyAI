@@ -16,6 +16,7 @@ from . import itemize as itemize_mod
 from . import splits_store
 from . import mirror as mirror_mod
 from . import statement_import as statement_import_mod
+from . import gmail_connector as gmail_mod
 from .errors import (
     ValidationError,
     RateLimitError,
@@ -127,6 +128,7 @@ def create_server() -> FastMCP:
     register_itemization_tools(mcp)
     register_sync_tools(mcp)
     register_statement_tools(mcp)
+    register_gmail_tools(mcp)
 
     logger.info("All tools registered successfully")
     
@@ -1421,4 +1423,49 @@ def register_statement_tools(mcp: FastMCP) -> None:
             raise
         except Exception as e:
             logger.error(f"Error confirming import: {e}")
+            raise
+
+
+# ============================================================================
+# Gmail Connector Tools (statement import Half B — read-only)
+# ============================================================================
+
+def register_gmail_tools(mcp: FastMCP) -> None:
+    """Register read-only Gmail tools that feed statement import.
+
+    These only READ Gmail (gmail.readonly) and return text — they never create expenses.
+    The agent extracts line-items from the returned statement text and routes them through
+    import_statement -> confirm_import (human review + dedup + exact paise). Requires a
+    one-time Google Cloud OAuth setup (see the Gmail connector design doc); the tools return
+    an actionable error if credentials are missing.
+    """
+
+    @mcp.tool()
+    async def gmail_find_statements(query: Optional[str] = None, max_results: int = 20) -> Dict[str, Any]:
+        """Find bank/card statement emails in Gmail (read-only). Returns message id/subject/
+        from/date/snippet for you to pick from. Omit query to use a default that targets common
+        Indian bank/card statement senders in the last 3 months. Then call gmail_read_statement.
+        """
+        try:
+            service = gmail_mod.get_service()
+            messages = gmail_mod.search_messages(service, query=query, max_results=max_results)
+            return {"count": len(messages), "messages": messages}
+        except RuntimeError as e:
+            return {"error": str(e), "setup_required": True}
+        except Exception as e:
+            logger.error(f"Error searching Gmail: {e}")
+            raise
+
+    @mcp.tool()
+    async def gmail_read_statement(message_id: str) -> Dict[str, Any]:
+        """Read one statement email's decoded text (read-only). Returns id/subject/from/date/text.
+        Extract the transactions from `text`, then call import_statement to review + import them.
+        """
+        try:
+            service = gmail_mod.get_service()
+            return gmail_mod.get_message_text(service, message_id)
+        except RuntimeError as e:
+            return {"error": str(e), "setup_required": True}
+        except Exception as e:
+            logger.error(f"Error reading Gmail message: {e}")
             raise

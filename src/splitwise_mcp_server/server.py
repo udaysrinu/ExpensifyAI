@@ -129,6 +129,7 @@ def create_server() -> FastMCP:
     register_sync_tools(mcp)
     register_statement_tools(mcp)
     register_gmail_tools(mcp)
+    register_pdf_statement_tools(mcp)
 
     logger.info("All tools registered successfully")
     
@@ -1468,4 +1469,57 @@ def register_gmail_tools(mcp: FastMCP) -> None:
             return {"error": str(e), "setup_required": True}
         except Exception as e:
             logger.error(f"Error reading Gmail message: {e}")
+            raise
+
+
+# ============================================================================
+# PDF Statement Tools (unlock password-protected statement PDFs, CRED-style)
+# ============================================================================
+
+def register_pdf_statement_tools(mcp: FastMCP) -> None:
+    """Register the statement-PDF unlock+parse tool.
+
+    Downloads a statement PDF attachment from a Gmail message, derives likely passwords from
+    the user's name/DOB/card-last4 (or an explicit password), decrypts (pikepdf), extracts the
+    transaction table (pdfplumber), and returns parsed rows. Read-only; nothing is created.
+    Pair with import_statement -> confirm_import to actually record expenses.
+    """
+
+    @mcp.tool()
+    async def unlock_statement_pdf(
+        message_id: str,
+        name: Optional[str] = None,
+        dob: Optional[str] = None,
+        card_last4: Optional[str] = None,
+        password: Optional[str] = None,
+        attachment_index: int = 0,
+    ) -> Dict[str, Any]:
+        """Unlock + parse a password-protected statement PDF attached to a Gmail message.
+
+        Provide name + dob (+ optional card_last4) so passwords can be derived (common Indian
+        bank formats), or pass an explicit `password`. Returns parsed transactions
+        [{date, description, amount, credit}] plus counts. Then review via import_statement.
+        """
+        try:
+            from . import pdf_statement as pdf_mod
+            service = gmail_mod.get_service()
+            atts = gmail_mod.list_attachments(service, message_id)
+            pdfs = [a for a in atts if a["filename"].lower().endswith(".pdf")]
+            if not pdfs:
+                return {"error": "No PDF attachment found on that message.", "attachments": atts}
+            att = pdfs[min(attachment_index, len(pdfs) - 1)]
+            data = gmail_mod.download_attachment(service, message_id, att["attachment_id"])
+            hints = {"name": name, "dob": dob, "card_last4": card_last4,
+                     "custom": [password] if password else None}
+            try:
+                result = pdf_mod.unlock_and_parse(data, hints)
+            except pdf_mod.PdfDecryptError as e:
+                return {"error": str(e), "unlocked": False, "filename": att["filename"]}
+            result["unlocked"] = True
+            result["filename"] = att["filename"]
+            return result
+        except RuntimeError as e:
+            return {"error": str(e), "setup_required": True}
+        except Exception as e:
+            logger.error(f"Error unlocking statement PDF: {e}")
             raise

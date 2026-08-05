@@ -158,3 +158,27 @@ def get_message_text(service, msg_id: str) -> Dict[str, Any]:
         "date": _header(headers, "Date"),
         "text": _extract_parts_text(payload),
     }
+
+
+def list_attachments(service, msg_id: str) -> List[Dict[str, Any]]:
+    """Return [{filename, mime_type, attachment_id, size}] for a message's attachments."""
+    full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    out: List[Dict[str, Any]] = []
+
+    def walk(part):
+        body = part.get("body", {}) or {}
+        if part.get("filename") and body.get("attachmentId"):
+            out.append({"filename": part["filename"], "mime_type": part.get("mimeType", ""),
+                        "attachment_id": body["attachmentId"], "size": body.get("size", 0)})
+        for c in part.get("parts", []) or []:
+            walk(c)
+
+    walk(full.get("payload", {}) or {})
+    return out
+
+
+def download_attachment(service, msg_id: str, attachment_id: str) -> bytes:
+    """Download one attachment's raw bytes."""
+    att = service.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=attachment_id).execute()
+    return base64.urlsafe_b64decode(att["data"].encode("utf-8"))

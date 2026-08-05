@@ -59,6 +59,10 @@ gmail = [
     "google-auth-oauthlib>=1.0.0",
     "google-auth-httplib2>=0.2.0",
 ]
+statements = [
+    "pikepdf>=8.0.0",
+    "pdfplumber>=0.10.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/udaysrinu/ExpensifyAI"

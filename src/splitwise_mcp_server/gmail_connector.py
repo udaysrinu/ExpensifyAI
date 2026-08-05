@@ -182,3 +182,41 @@ def download_attachment(service, msg_id: str, attachment_id: str) -> bytes:
     att = service.users().messages().attachments().get(
         userId="me", messageId=msg_id, id=attachment_id).execute()
     return base64.urlsafe_b64decode(att["data"].encode("utf-8"))
+
+
+def list_images(service, msg_id: str) -> List[Dict[str, Any]]:
+    """Return image parts (inline or attached) for a message.
+
+    Banks sometimes state the statement-PDF password rule in an IMAGE (e.g. RBL). This surfaces
+    every image/* part so the caller can fetch it and read the rule via agent vision or OCR
+    (password_rule.ocr_image), then feed the transcribed text to parse_password_rule().
+    Returns [{filename, mime_type, attachment_id?, data_inline_b64?, size}].
+    """
+    full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    out: List[Dict[str, Any]] = []
+
+    def walk(part):
+        mime = part.get("mimeType", "") or ""
+        body = part.get("body", {}) or {}
+        if mime.startswith("image/"):
+            entry = {"filename": part.get("filename", ""), "mime_type": mime,
+                     "size": body.get("size", 0)}
+            if body.get("attachmentId"):
+                entry["attachment_id"] = body["attachmentId"]
+            elif body.get("data"):
+                entry["data_inline_b64"] = body["data"]  # small inline images ship in-body
+            out.append(entry)
+        for c in part.get("parts", []) or []:
+            walk(c)
+
+    walk(full.get("payload", {}) or {})
+    return out
+
+
+def get_image_bytes(service, msg_id: str, image: Dict[str, Any]) -> bytes:
+    """Fetch raw bytes for an image entry from list_images() (handles inline OR attachment)."""
+    if image.get("data_inline_b64"):
+        return base64.urlsafe_b64decode(image["data_inline_b64"].encode("utf-8"))
+    if image.get("attachment_id"):
+        return download_attachment(service, msg_id, image["attachment_id"])
+    raise ValueError("image entry has neither inline data nor an attachment_id")

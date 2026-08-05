@@ -63,6 +63,13 @@ statements = [
     "pikepdf>=8.0.0",
     "pdfplumber>=0.10.0",
 ]
+# Optional OCR fallback for reading password-rule IMAGES (e.g. RBL). Agent vision is preferred
+# and needs nothing here; this is for headless/cron runs. Also needs the tesseract binary
+# (brew install tesseract / apt-get install tesseract-ocr).
+ocr = [
+    "pytesseract>=0.3.10",
+    "pillow>=10.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/udaysrinu/ExpensifyAI"

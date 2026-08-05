@@ -52,6 +52,31 @@ def test_parse_skips_pure_number_lines():
     assert len(rows) == 1 and rows[0]["description"] == "REAL MERCHANT"
 
 
+def test_clean_transactions_drops_noise_and_credits():
+    txns = [
+        {"date": "16/06/2026", "description": "USHA NARAYANA REDDYS", "amount": "4047.20", "credit": False},
+        {"date": "01/07/2026", "description": "FINANCE CHARGES (Ref# 199...)", "amount": "888.28", "credit": False},
+        {"date": "01/07/2026", "description": "IGST-VPS...", "amount": "160.00", "credit": False},
+        {"date": "15/06/2026", "description": "PAYMENT RECEIVED", "amount": "5000.00", "credit": True},
+        {"date": "10/06/2026", "description": "Amazon cashback", "amount": "50.00", "credit": False},
+        {"date": "12/2019", "description": "FEE SCHEDULE ROW", "amount": "500.00", "credit": False},
+    ]
+    kept = p.clean_transactions(txns)
+    descs = [t["description"] for t in kept]
+    assert descs == ["USHA NARAYANA REDDYS"]          # only the real purchase survives
+    assert not any("FINANCE CHARGES" in d for d in descs)   # plural 's' regression (was leaking)
+
+
+def test_password_candidates_mobile_and_rule_text():
+    # SBI-style: mobile-last5 + DDMMYY, via brute-force fallback (synthetic hints, not real data)
+    pwds = p.password_candidates({"mobile": "9990054321", "dob": "01011990"})
+    assert "54321010190" in pwds
+    # rule_text (bank-stated) is derived and placed FIRST
+    rule = "last five digits of registered mobile number and date of birth in DDMMYY format"
+    pwds2 = p.password_candidates({"mobile": "9990054321", "dob": "01011990", "rule_text": rule})
+    assert pwds2[0] == "54321010190"
+
+
 def test_decrypt_pdf_missing_lib_or_unencrypted(monkeypatch):
     # a minimal unencrypted PDF should return unchanged (if pikepdf present);
     # if pikepdf missing, raises PdfDecryptError — either way, no crash on our code path.

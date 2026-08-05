@@ -30,9 +30,10 @@ def password_candidates(hints: Dict[str, Any]) -> List[str]:
     """Build likely statement-PDF passwords from hints, most-likely first (deduped).
 
     hints keys (all optional): name (full or first), dob ('DDMMYYYY' or 'DD-MM-YYYY'),
-    card_last4, custom (list of explicit passwords to try first).
+    card_last4, mobile, custom (explicit passwords to try first), rule_text (a password rule the
+    bank STATED in its email/image — parsed and derived first, most precise).
     Covers common Indian formats: HDFC (first4 name lower/UPPER + DDMM), ICICI/Axis (name+dob),
-    SBI/OneCard (card4 + DDMM), etc. Callers can also pass `custom` for anything bespoke.
+    SBI (mobile-last5 + DDMMYY), RBL (NAME4 caps + DDMMYY), etc. `custom` handles anything bespoke.
     """
     out: List[str] = []
     seen = set()
@@ -44,6 +45,16 @@ def password_candidates(hints: Dict[str, Any]) -> List[str]:
 
     for pw in hints.get("custom") or []:
         add(str(pw))
+
+    # a rule the bank stated (text, or transcribed from an image) -> most precise; try first
+    rule_text = hints.get("rule_text")
+    if rule_text:
+        try:
+            from . import password_rule
+            for pw in password_rule.passwords_from_rule_text(str(rule_text), hints):
+                add(pw)
+        except Exception:
+            pass  # never let rule parsing block the brute-force fallback below
 
     name = (hints.get("name") or "").strip()
     # each WORD of the full name yields a first-4 slice — the bank's "first name" may be any
@@ -62,22 +73,31 @@ def password_candidates(hints: Dict[str, Any]) -> List[str]:
     ddmm = dob_digits[:4] if len(dob_digits) >= 4 else ""
     mmdd = (dob_digits[2:4] + dob_digits[:2]) if len(dob_digits) >= 4 else ""
     ddmmyyyy = dob_digits[:8] if len(dob_digits) >= 8 else ""
+    ddmmyy = (dob_digits[:4] + dob_digits[6:8]) if len(dob_digits) >= 8 else ""  # RBL: DDMMYY
     yyyy = dob_digits[4:8] if len(dob_digits) >= 8 else ""
+    yy = dob_digits[6:8] if len(dob_digits) >= 8 else ""
     card4 = re.sub(r"\D", "", str(hints.get("card_last4") or ""))[:4]
+    mobile = re.sub(r"\D", "", str(hints.get("mobile") or ""))
+    mob5 = mobile[-5:] if len(mobile) >= 5 else ""  # SBI: last 5 digits of registered mobile
 
-    # name-slice (case variants) + DOB orderings — the common HDFC/ICICI/Axis family
+    # name-slice (case variants) + DOB orderings — the common HDFC/ICICI/RBL/Axis family
     for s4 in slices:
-        for dob_part in (ddmm, mmdd, ddmmyyyy, yyyy):
+        for dob_part in (ddmm, ddmmyy, mmdd, ddmmyyyy, yyyy, yy):
             if not dob_part:
                 continue
             add(s4.lower() + dob_part)
             add(s4.upper() + dob_part)
             add(s4.capitalize() + dob_part)
-    # card last4 + DOB (SBI/OneCard style), and simple fallbacks
+    # card last4 + DOB (OneCard style), and simple fallbacks
     for dob_part in (ddmm, mmdd, yyyy, ddmmyyyy):
         if card4 and dob_part:
             add(card4 + dob_part)
             add(dob_part + card4)
+    # mobile-last5 + DOB (SBI e-statement style), both orderings + common formats
+    for dob_part in (ddmmyy, ddmm, ddmmyyyy):
+        if mob5 and dob_part:
+            add(mob5 + dob_part)
+            add(dob_part + mob5)
     add(card4 or None)
     add(ddmmyyyy or None)
     return out
@@ -170,6 +190,40 @@ def parse_transactions(text: str) -> List[Dict[str, Any]]:
                 })
                 break
     return rows
+
+
+# noise patterns: bank fees/tax/rewards/EMI-interest/payments — NOT real spends to split
+_NOISE_RE = re.compile(
+    r"(?i)\b(IGST|CGST|SGST|GST|cashback|cash back|reversal|finance charges?|late fee|"
+    r"EMI,?\s?(INT|PRIN)|interest|tele transfer|payment received|autopay|"
+    r"reward|surcharge|convenience fee|markup|annual fee|joining fee|goods & service tax)\b")
+
+
+def clean_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep real purchase rows; drop credits and bank fee/tax/reward/EMI-interest noise.
+
+    A statement's raw parse includes GST lines, cashback credits, finance charges, EMI interest,
+    payments, and sometimes T&C/fee-schedule table rows with old dates. Those are NOT expenses to
+    split — this filters them so only genuine merchant purchases remain for review/import.
+    """
+    out = []
+    for t in txns:
+        if t.get("credit"):
+            continue
+        desc = t.get("description", "")
+        if _NOISE_RE.search(desc):
+            continue
+        # drop rows whose "date" year is far in the past (T&C/fee-schedule tables)
+        yr = re.search(r"(20\d{2})", t.get("date", ""))
+        if yr and int(yr.group(1)) < 2024:
+            continue
+        try:
+            if float(t.get("amount", "0")) <= 0:
+                continue
+        except ValueError:
+            continue
+        out.append(t)
+    return out
 
 
 def unlock_and_parse(data: bytes, hints: Dict[str, Any]) -> Dict[str, Any]:

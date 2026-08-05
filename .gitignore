@@ -89,3 +89,7 @@ analytics_reports/
 htmlcov/
 .coverage
 *.png
+
+# Local statement processing (sensitive financial PDFs / parsed output) — never commit
+_scratch/
+*.pdf

@@ -192,11 +192,69 @@ def parse_transactions(text: str) -> List[Dict[str, Any]]:
     return rows
 
 
+# Savings/current-account row: DD-MM-YY  <narration>  <credit> <debit> <balance>
+# (credit & debit are amounts or a literal 0; balance is always a decimal). SBI/most banks.
+_BANK_ROW = re.compile(
+    r"^(?P<date>\d{2}-\d{2}-\d{2,4})\s+(?P<desc>.*?)\s+"
+    r"(?P<credit>[\d,]+\.\d{2}|0)\s+(?P<debit>[\d,]+\.\d{2}|0)\s+(?P<bal>[\d,]+\.\d{2})\s*$")
+
+
+def parse_bank_transactions(text: str) -> List[Dict[str, Any]]:
+    """Parse a savings/current-account statement (credit/debit/balance columns).
+
+    Different document type from a credit-card statement: each row carries a credit AND a debit
+    column plus a running balance. Returns [{date, description, amount, credit, balance}] where
+    `amount` is whichever of credit/debit is non-zero and `credit=True` for inflows. The caller
+    should clean_bank_transactions() to drop card-bill payments (double-count!), salary, transfers.
+    """
+    rows: List[Dict[str, Any]] = []
+    prev_narration = ""  # SBI wraps long narrations onto the PREVIOUS line (no date/amounts)
+    for line in text.splitlines():
+        s = line.strip()
+        m = _BANK_ROW.match(s)
+        if not m:
+            # remember a plausible narration line (not a header/blank) to stitch into a blank row
+            if s and not re.search(r"(?i)date\s+transaction|balance|customer\s|welcome", s):
+                prev_narration = s
+            continue
+        cr = m.group("credit").replace(",", "")
+        dr = m.group("debit").replace(",", "")
+        is_credit = cr not in ("0", "0.00")
+        amt = cr if is_credit else dr
+        if amt in ("0", "0.00"):
+            prev_narration = ""
+            continue
+        desc = m.group("desc").strip(" -")
+        if not desc and prev_narration:
+            desc = prev_narration  # stitch wrapped merchant name from the preceding line
+        rows.append({
+            "date": m.group("date"),
+            "description": desc,
+            "amount": amt,
+            "credit": is_credit,
+            "balance": m.group("bal").replace(",", ""),
+        })
+        prev_narration = ""
+    return rows
+
+
 # noise patterns: bank fees/tax/rewards/EMI-interest/payments — NOT real spends to split
 _NOISE_RE = re.compile(
     r"(?i)\b(IGST|CGST|SGST|GST|cashback|cash back|reversal|finance charges?|late fee|"
     r"EMI,?\s?(INT|PRIN)|interest|tele transfer|payment received|autopay|"
     r"reward|surcharge|convenience fee|markup|annual fee|joining fee|goods & service tax)\b")
+
+# Savings-account-specific noise: credit-card-bill payments (would DOUBLE-COUNT the card txns),
+# salary/investment inflows, self-transfers, ATM. Only merchant debits are splittable candidates.
+_BANK_NOISE_RE = re.compile(
+    r"(?i)(cred\s?club|cred\.club|"                     # CRED = paying a credit-card bill
+    r"\bsalary\b|SAL-A|PFS Salary|"                       # salary inflow
+    r"zerodha|groww|kite|upstox|\bnse\b|\bbse\b|mutual fund|"  # investments
+    r"interest credit|cr int|"                            # bank interest
+    r"\bATM\b|cash wdl|cash withdrawal|"                   # cash
+    r"ACHCr|NACH|dividend|FNLDIV|"                         # dividends / ACH credits
+    r"IMPS/\d+/ybp-|self)"                                 # self / broker transfers
+)
 
 
 def clean_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -216,6 +274,29 @@ def clean_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # drop rows whose "date" year is far in the past (T&C/fee-schedule tables)
         yr = re.search(r"(20\d{2})", t.get("date", ""))
         if yr and int(yr.group(1)) < 2024:
+            continue
+        try:
+            if float(t.get("amount", "0")) <= 0:
+                continue
+        except ValueError:
+            continue
+        out.append(t)
+    return out
+
+
+def clean_bank_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """From savings-account rows, keep only splittable merchant DEBITS.
+
+    Drops (a) all credits/inflows, (b) credit-card-bill payments (CRED etc.) — importing these
+    AND the card statement would double-count every purchase, (c) salary/investment/dividend/
+    interest/ATM/self-transfer noise. What remains are genuine outgoing spends worth reviewing.
+    """
+    out = []
+    for t in txns:
+        if t.get("credit"):
+            continue  # inflows are never a shared expense
+        desc = t.get("description", "")
+        if _BANK_NOISE_RE.search(desc) or _NOISE_RE.search(desc):
             continue
         try:
             if float(t.get("amount", "0")) <= 0:
